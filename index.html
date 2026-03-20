@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Papertrail</title>
+    <meta name="description" content="Drop in a PDF. Chat with it. Everything runs in your browser.">
+    <link rel="stylesheet" href="./src/styles/app.css">
+    <script type="importmap">
+      {
+        "imports": {
+          "pdfjs-dist": "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.mjs",
+          "@huggingface/hub": "https://esm.sh/@huggingface/hub@2.11.0?bundle",
+          "@huggingface/jinja": "https://esm.sh/@huggingface/jinja@0.5.6?bundle"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div class="app-shell" data-state="landing" data-tab="viewer">
+
+      <!-- ═══════════════════════════════════════════
+           LANDING SCREEN
+           ═══════════════════════════════════════════ -->
+      <div class="screen landing-screen">
+        <div class="landing-card">
+
+          <div class="brand">
+            <div class="brand-icon">
+              <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+                <rect x="4" y="2" width="16" height="20" rx="2" stroke="currentColor" stroke-width="1.6" fill="none"/>
+                <path d="M10 8h6M10 12h6M10 16h4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+                <path d="M18 14l6 6M21.5 17.5l2.5 2.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+              </svg>
+            </div>
+            <h1 class="brand-name">Papertrail</h1>
+          </div>
+          <p class="brand-sub">Drop in a PDF. Chat with it. Everything runs in your browser.</p>
+
+          <label class="drop-zone" for="pdf-upload" id="drop-zone">
+            <input id="pdf-upload" type="file" accept="application/pdf">
+            <div class="drop-inner">
+              <div class="drop-icon-wrap">
+                <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <polyline points="14 2 14 8 20 8"/>
+                  <line x1="9" y1="13" x2="15" y2="13"/>
+                  <line x1="9" y1="17" x2="11" y2="17"/>
+                </svg>
+              </div>
+              <span class="drop-label">Drop a PDF here</span>
+              <span class="drop-hint">or click to browse &middot; stays on your device</span>
+            </div>
+          </label>
+
+          <div class="recent-docs" id="recent-docs-landing"></div>
+
+        </div>
+      </div>
+
+      <!-- ═══════════════════════════════════════════
+           PROCESSING SCREEN
+           ═══════════════════════════════════════════ -->
+      <div class="screen processing-screen">
+        <div class="processing-card">
+          <div class="proc-rings">
+            <div class="proc-ring proc-ring-1"></div>
+            <div class="proc-ring proc-ring-2"></div>
+            <div class="proc-ring proc-ring-3"></div>
+          </div>
+          <p class="proc-title" id="processing-label">Reading document&hellip;</p>
+          <p class="proc-detail" id="processing-detail"></p>
+        </div>
+      </div>
+
+      <!-- ═══════════════════════════════════════════
+           APP SCREEN
+           ═══════════════════════════════════════════ -->
+      <div class="screen app-screen">
+
+        <header class="topbar">
+          <div class="topbar-left">
+            <span class="app-title">Papertrail</span>
+          </div>
+          <div class="topbar-center" id="doc-title-bar"></div>
+          <div class="topbar-right">
+            <span id="bg-progress" class="bg-progress" hidden></span>
+            <button id="export-layout-button" class="topbar-btn" title="Export layout data" type="button">
+              <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
+                <path d="M7.5 1.5v8M4 7l3.5 3.5L11 7M2 12.5h11" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
+        </header>
+
+        <div class="workspace">
+
+          <!-- Page rail -->
+          <aside class="rail-panel">
+            <div id="page-rail" class="page-rail"></div>
+          </aside>
+
+          <!-- PDF Viewer -->
+          <section class="viewer-panel">
+            <div class="viewer-toolbar">
+              <div class="toolbar-group">
+                <button id="prev-page-button" class="tool-btn" type="button" aria-label="Previous page">
+                  <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M9 2L5 7l4 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+                <span id="page-label" class="page-label">1 / 1</span>
+                <button id="next-page-button" class="tool-btn" type="button" aria-label="Next page">
+                  <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M5 2l4 5-4 5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+              </div>
+              <div class="toolbar-group">
+                <button id="zoom-out-button" class="tool-btn" type="button" aria-label="Zoom out">
+                  <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M2 6.5h9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                </button>
+                <span id="zoom-label" class="zoom-label">100%</span>
+                <button id="zoom-in-button" class="tool-btn" type="button" aria-label="Zoom in">
+                  <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M6.5 2v9M2 6.5h9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                </button>
+              </div>
+            </div>
+            <div id="viewer-frame" class="viewer-frame">
+              <div id="viewer-surface" class="viewer-surface">
+                <canvas id="pdf-canvas" aria-label="PDF page"></canvas>
+                <div id="bbox-overlay" class="bbox-overlay" aria-hidden="true"></div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Chat panel -->
+          <aside class="chat-panel">
+            <div class="chat-doc-header" id="doc-header"></div>
+            <div class="chat-model-bar">
+              <label class="model-stack" for="model-select">
+                <span>Model</span>
+                <select id="model-select" class="model-select">
+                  <option value="onnx-community/Qwen3.5-0.8B-ONNX">0.8B</option>
+                  <option value="onnx-community/Qwen3.5-2B-ONNX">2B</option>
+                  <option value="onnx-community/Qwen3.5-4B-ONNX">4B</option>
+                </select>
+              </label>
+              <button id="load-model-button" class="model-load-btn" type="button">Load Model</button>
+            </div>
+            <p id="model-status-text" class="model-status-text">
+              0.8B is not loaded yet. Search fallback remains available.
+            </p>
+            <div id="chat-log" class="chat-log"></div>
+            <form id="chat-form" class="chat-form">
+              <textarea
+                id="chat-input"
+                class="chat-input"
+                name="message"
+                rows="1"
+                placeholder="Ask anything about this document&hellip;"
+              ></textarea>
+              <button class="send-btn" type="submit" aria-label="Send">
+                <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
+                  <path d="M7.5 12V3M3.5 7l4-4 4 4" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+            </form>
+          </aside>
+
+        </div>
+
+        <!-- Mobile tab bar -->
+        <nav class="tab-bar">
+          <button class="tab-btn is-active" data-tab="viewer" type="button">View</button>
+          <button class="tab-btn" data-tab="chat" type="button">Chat</button>
+        </nav>
+
+      </div><!-- /app-screen -->
+
+      <!-- ═══════════════════════════════════════════
+           COMPAT ELEMENTS  (JS hooks, never shown)
+           ═══════════════════════════════════════════ -->
+      <div style="display:none" aria-hidden="true">
+        <span id="status-pill"></span>
+        <div id="document-stats"></div>
+        <div id="search-results"></div>
+        <div id="saved-snapshots"></div>
+        <span id="ocr-runtime-badge"></span>
+        <span id="qwen-runtime-badge"></span>
+        <p id="ocr-runtime-copy"></p>
+        <p id="qwen-runtime-copy"></p>
+        <button id="probe-models-button" type="button"></button>
+        <form id="search-form"><input id="search-input" type="search" name="query"></form>
+      </div>
+
+    </div><!-- /app-shell -->
+
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "pdf-tool-chat-lab",
+  "private": true,
+  "type": "module",
+  "description": "GitHub Pages friendly PDF viewer with client-side indexing, custom vector search, and model runtime scaffolding.",
+  "scripts": {
+    "dev": "bun run server.ts",
+    "serve": "bun run server.ts",
+    "build:wasm": "clang --target=wasm32 -O3 -nostdlib -Wl,--no-entry -Wl,--export-all -Wl,--strip-all -o src/vdb/vector-kernel.wasm src/vdb/vector-kernel.c"
+  },
+  "dependencies": {
+    "@huggingface/hub": "^2.11.0",
+    "@huggingface/jinja": "^0.5.6",
+    "pdfjs-dist": "^4.10.38"
+  }
+}
