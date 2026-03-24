@@ -61,6 +61,13 @@ export const MAX_CHARS_PER_CHUNK = 2048;
  * head_dim is derived if absent.
  */
 const QWEN35_CONFIGS = {
+  "Intel/Qwen3.5-4B-int4-AutoRound": {
+    hidden_size: 2560,
+    num_hidden_layers: 32,
+    num_attention_heads: 16,
+    num_key_value_heads: 4,
+    head_dim: 256
+  },
   "Qwen/Qwen3.5-0.8B": {
     hidden_size: 1024,
     num_hidden_layers: 24,
@@ -99,7 +106,7 @@ const QWEN35_CONFIGS = {
 };
 
 export function resolveModelConfig(modelId) {
-  return QWEN35_CONFIGS[modelId] ?? QWEN35_CONFIGS["Qwen/Qwen3.5-0.8B"];
+  return QWEN35_CONFIGS[modelId] ?? QWEN35_CONFIGS["Intel/Qwen3.5-4B-int4-AutoRound"];
 }
 
 // ─── Math utilities ───────────────────────────────────────────────────────────

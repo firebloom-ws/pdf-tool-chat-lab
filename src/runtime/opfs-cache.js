@@ -82,4 +82,19 @@ export class OpfsCache {
     }
     return JSON.parse(new TextDecoder().decode(bytes));
   }
+
+  async delete(key) {
+    const root = await this.getRoot();
+    if (!root) {
+      return;
+    }
+    try {
+      await root.removeEntry(encodeKey(key));
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "NotFoundError") {
+        return;
+      }
+      throw error;
+    }
+  }
 }

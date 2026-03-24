@@ -1,18 +1,17 @@
 const QWEN_MODEL_ALIASES = {
-  "onnx-community/Qwen3.5-0.8B-ONNX": "Qwen/Qwen3.5-0.8B",
-  "onnx-community/Qwen3.5-2B-ONNX": "Qwen/Qwen3.5-2B"
+  "onnx-community/Qwen3.5-0.8B-ONNX": "Intel/Qwen3.5-4B-int4-AutoRound",
+  "onnx-community/Qwen3.5-2B-ONNX": "Intel/Qwen3.5-4B-int4-AutoRound",
+  "onnx-community/Qwen3.5-4B-ONNX": "Intel/Qwen3.5-4B-int4-AutoRound",
+  "Qwen/Qwen3.5-0.8B": "Intel/Qwen3.5-4B-int4-AutoRound",
+  "Qwen/Qwen3.5-2B": "Intel/Qwen3.5-4B-int4-AutoRound",
+  "Qwen/Qwen3.5-4B": "Intel/Qwen3.5-4B-int4-AutoRound"
 };
 
 export const QWEN_WEBGPU_MODELS = [
   {
-    id: "Qwen/Qwen3.5-0.8B",
-    label: "0.8B",
-    description: "Smallest Tensorbend WebGPU model"
-  },
-  {
-    id: "Qwen/Qwen3.5-2B",
-    label: "2B",
-    description: "Stronger answers, larger download"
+    id: "Intel/Qwen3.5-4B-int4-AutoRound",
+    label: "4B AutoRound",
+    description: "Packed INT4 Tensorbend WebGPU runtime"
   }
 ];
 
@@ -77,12 +76,13 @@ function summarizeProgress(info, phase = "model") {
 
 function describeReadyDetail(message, fallbackLabel, fallbackDtype) {
   const label = modelLabelFor(message.modelId ?? fallbackLabel);
-  const dtype = message.dtype ?? fallbackDtype ?? "bf16/f16";
+  const dtype = message.dtype ?? fallbackDtype ?? "int4";
   const contextLength = Number(message.contextLength);
+  const cacheMode = message.cacheMode === "packed-opfs" ? "packed local cache" : null;
   if (Number.isFinite(contextLength) && contextLength > 0) {
-    return `${label} loaded on WebGPU via Tensorbend (${dtype}, ${contextLength}-token context).`;
+    return `${label} loaded on WebGPU via Tensorbend (${dtype}, ${contextLength}-token context${cacheMode ? `, ${cacheMode}` : ""}).`;
   }
-  return `${label} loaded on WebGPU via Tensorbend (${dtype}).`;
+  return `${label} loaded on WebGPU via Tensorbend (${dtype}${cacheMode ? `, ${cacheMode}` : ""}).`;
 }
 
 export class QwenWebGpuTextRuntime {
@@ -102,7 +102,7 @@ export class QwenWebGpuTextRuntime {
     this.loadPromise = null;
     this.requestCounter = 0;
     this.state = {
-      backend: "tensorbend/webgpu",
+      backend: "papertrail/tensorbend-webgpu",
       modelId: this.modelId,
       label: modelLabelFor(this.modelId),
       status: "idle",
@@ -338,7 +338,7 @@ export class QwenWebGpuTextRuntime {
           label: modelLabelFor(message.modelId ?? this.modelId),
           status: "ready",
           ready: true,
-          dtype: message.dtype ?? this.state.dtype ?? "bf16/f16",
+          dtype: message.dtype ?? this.state.dtype ?? "int4",
           progress: 100,
           error: null,
           detail,
@@ -409,7 +409,8 @@ export class QwenWebGpuTextRuntime {
             {
               modelId: this.state.modelId,
               dtype: this.state.dtype,
-              contextLength: message.contextLength
+              contextLength: message.contextLength,
+              cacheMode: message.cacheMode
             },
             this.state.modelId,
             this.state.dtype
@@ -433,7 +434,8 @@ export class QwenWebGpuTextRuntime {
             {
               modelId: this.state.modelId,
               dtype: this.state.dtype,
-              contextLength: message.contextLength
+              contextLength: message.contextLength,
+              cacheMode: message.cacheMode
             },
             this.state.modelId,
             this.state.dtype
@@ -450,7 +452,8 @@ export class QwenWebGpuTextRuntime {
                 {
                   modelId: this.state.modelId,
                   dtype: this.state.dtype,
-                  contextLength: message.contextLength
+                  contextLength: message.contextLength,
+                  cacheMode: message.cacheMode
                 },
                 this.state.modelId,
                 this.state.dtype

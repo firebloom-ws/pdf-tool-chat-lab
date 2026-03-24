@@ -319,13 +319,15 @@ export class AppController {
     if (!select) return;
 
     select.innerHTML = "";
-    for (const option of this.qwenRuntime.getModelOptions()) {
+    const options = this.qwenRuntime.getModelOptions();
+    for (const option of options) {
       const el = document.createElement("option");
       el.value = option.id;
       el.textContent = `${option.label} · ${option.description}`;
       select.append(el);
     }
     select.value = this.qwenRuntime.getModelState().modelId;
+    select.disabled = options.length <= 1;
   }
 
   updateQwenModelState(state) {

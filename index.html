@@ -137,15 +137,13 @@
               <label class="model-stack" for="model-select">
                 <span>Model</span>
                 <select id="model-select" class="model-select">
-                  <option value="onnx-community/Qwen3.5-0.8B-ONNX">0.8B</option>
-                  <option value="onnx-community/Qwen3.5-2B-ONNX">2B</option>
-                  <option value="onnx-community/Qwen3.5-4B-ONNX">4B</option>
+                  <option value="Intel/Qwen3.5-4B-int4-AutoRound">4B AutoRound</option>
                 </select>
               </label>
               <button id="load-model-button" class="model-load-btn" type="button">Load Model</button>
             </div>
             <p id="model-status-text" class="model-status-text">
-              0.8B is not loaded yet. Search fallback remains available.
+              4B AutoRound is not loaded yet. Search fallback remains available.
             </p>
             <div id="chat-log" class="chat-log"></div>
             <form id="chat-form" class="chat-form">
