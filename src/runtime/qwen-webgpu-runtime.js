@@ -1,16 +1,16 @@
 const QWEN_MODEL_ALIASES = {
-  "onnx-community/Qwen3.5-0.8B-ONNX": "Intel/Qwen3.5-4B-int4-AutoRound",
-  "onnx-community/Qwen3.5-2B-ONNX": "Intel/Qwen3.5-4B-int4-AutoRound",
-  "onnx-community/Qwen3.5-4B-ONNX": "Intel/Qwen3.5-4B-int4-AutoRound",
-  "Qwen/Qwen3.5-0.8B": "Intel/Qwen3.5-4B-int4-AutoRound",
-  "Qwen/Qwen3.5-2B": "Intel/Qwen3.5-4B-int4-AutoRound",
-  "Qwen/Qwen3.5-4B": "Intel/Qwen3.5-4B-int4-AutoRound"
+  "onnx-community/Qwen3.5-0.8B-ONNX": "Intel/Qwen3.5-2B-int4-AutoRound",
+  "onnx-community/Qwen3.5-2B-ONNX": "Intel/Qwen3.5-2B-int4-AutoRound",
+  "onnx-community/Qwen3.5-4B-ONNX": "Intel/Qwen3.5-2B-int4-AutoRound",
+  "Qwen/Qwen3.5-0.8B": "Intel/Qwen3.5-2B-int4-AutoRound",
+  "Qwen/Qwen3.5-2B": "Intel/Qwen3.5-2B-int4-AutoRound",
+  "Qwen/Qwen3.5-4B": "Intel/Qwen3.5-2B-int4-AutoRound"
 };
 
 export const QWEN_WEBGPU_MODELS = [
   {
-    id: "Intel/Qwen3.5-4B-int4-AutoRound",
-    label: "4B AutoRound",
+    id: "Intel/Qwen3.5-2B-int4-AutoRound",
+    label: "2B AutoRound",
     description: "Packed INT4 Tensorbend WebGPU runtime"
   }
 ];

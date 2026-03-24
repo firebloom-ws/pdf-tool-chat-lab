@@ -1,7 +1,7 @@
 import { BytePairTokenizer } from "./tokenizer-bpe.js";
 import { TensorbendPackedCache } from "./tensorbend-packed-cache.js";
 
-const MODEL_ID = "Intel/Qwen3.5-4B-int4-AutoRound";
+const MODEL_ID = "Intel/Qwen3.5-2B-int4-AutoRound";
 const DEFAULT_REVISION = "main";
 const DEFAULT_DTYPE = "int4-auto-round";
 const CACHE_NAMESPACE = "papertrail-tensorbend";
