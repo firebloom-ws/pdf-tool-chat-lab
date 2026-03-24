@@ -226,6 +226,8 @@ export class AppController {
     this.vectorDatabase = null;
     this.toolRegistry = null;
     this.messages = [];
+    this.ocrProbePromise = null;
+    this.lastOcrProbe = null;
 
     // Document-profile state subscription — updates the bg-progress pill
     this._profileUnsub = this.qwenRuntime.subscribeDocumentProfile((profileState) => {
@@ -378,6 +380,66 @@ export class AppController {
     if (this.elements.qwenCopy) {
       this.elements.qwenCopy.textContent = text?.textContent ?? state.detail;
     }
+  }
+
+  updateOcrProbeState(ocrInfo, gpuInfo = this.webgpuRuntime.getState?.() ?? null) {
+    if (!ocrInfo) {
+      return;
+    }
+
+    const gpuNote = gpuInfo?.available
+      ? " WebGPU available."
+      : gpuInfo?.reason
+        ? ` ${gpuInfo.reason}`
+        : "";
+
+    const ocrPreview = ocrInfo.previewTensor
+      ? ` Sampled ${ocrInfo.previewTensor.name} (${ocrInfo.previewTensor.dtype}).`
+      : "";
+
+    if (this.elements.ocrBadge) {
+      this.elements.ocrBadge.textContent = "Hub Ready";
+      this.elements.ocrBadge.className = "pill pill-warning";
+    }
+    if (this.elements.ocrCopy) {
+      this.elements.ocrCopy.textContent =
+        `${ocrInfo.model.files.filter((f) => f.exists).length}/${ocrInfo.model.files.length} files.` +
+        ocrPreview +
+        gpuNote;
+    }
+  }
+
+  ensureOcrProbe(gpuInfo) {
+    if (this.lastOcrProbe) {
+      this.updateOcrProbeState(this.lastOcrProbe, gpuInfo);
+      return Promise.resolve(this.lastOcrProbe);
+    }
+
+    if (!this.ocrProbePromise) {
+      this.ocrProbePromise = this.ocrRuntime
+        .probe()
+        .then((ocrInfo) => {
+          this.lastOcrProbe = ocrInfo;
+          this.updateOcrProbeState(ocrInfo, gpuInfo);
+          return ocrInfo;
+        })
+        .catch((error) => {
+          console.error("OCR probe failed", error);
+          if (this.elements.ocrBadge) {
+            this.elements.ocrBadge.textContent = "Probe Failed";
+            this.elements.ocrBadge.className = "pill pill-warning";
+          }
+          if (this.elements.ocrCopy) {
+            this.elements.ocrCopy.textContent = "OCR assets could not be inspected right now.";
+          }
+          return null;
+        })
+        .finally(() => {
+          this.ocrProbePromise = null;
+        });
+    }
+
+    return this.ocrProbePromise;
   }
 
   /* ── event binding ──────────────────────────────────────── */
@@ -725,29 +787,12 @@ export class AppController {
 
   async probeModels() {
     this.setStatus("Loading model assets", "working");
-    const [ocrInfo, qwenInfo, gpuInfo] = await Promise.all([
-      this.ocrRuntime.probe(),
-      this.qwenRuntime.probe(),
-      this.webgpuRuntime.probe()
-    ]);
+    const gpuInfo = await this.webgpuRuntime.probe();
+    const qwenInfo = await this.qwenRuntime.probe();
 
     const gpuNote = gpuInfo.available
       ? " WebGPU available."
       : ` ${gpuInfo.reason}`;
-
-    const ocrPreview = ocrInfo.previewTensor
-      ? ` Sampled ${ocrInfo.previewTensor.name} (${ocrInfo.previewTensor.dtype}).`
-      : "";
-
-    if (this.elements.ocrBadge) {
-      this.elements.ocrBadge.textContent = "Hub Ready";
-      this.elements.ocrBadge.className = "pill pill-warning";
-    }
-    if (this.elements.ocrCopy) {
-      this.elements.ocrCopy.textContent =
-        `${ocrInfo.model.files.filter((f) => f.exists).length}/${ocrInfo.model.files.length} files.` +
-        ocrPreview + gpuNote;
-    }
     this.updateQwenModelState(this.qwenRuntime.getModelState());
     if (this.elements.qwenCopy) {
       this.elements.qwenCopy.textContent =
@@ -760,7 +805,10 @@ export class AppController {
 
     this.setBackgroundProgress("");
     this.setStatus("Ready", "success");
-    return { ocrInfo, qwenInfo, gpuInfo };
+
+    void this.ensureOcrProbe(gpuInfo);
+
+    return { ocrInfo: this.lastOcrProbe, qwenInfo, gpuInfo };
   }
 
   /* ── snapshots ──────────────────────────────────────────── */

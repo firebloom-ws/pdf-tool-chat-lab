@@ -43,6 +43,10 @@ function summarizeProgress(info, phase = "model") {
   }
 
   const fileName = info.file ? String(info.file).split("/").at(-1) : null;
+  const groupLabel =
+    Number.isFinite(info.group) && Number.isFinite(info.totalGroups)
+      ? `, chunk ${info.group}/${info.totalGroups}`
+      : "";
   const percent =
     normalizeProgress(info.progress) ??
     (typeof info.loaded === "number" &&
@@ -52,11 +56,11 @@ function summarizeProgress(info, phase = "model") {
       : null);
 
   if (fileName && percent !== null) {
-    return `Loading ${fileName} (${percent}%)`;
+    return `Loading ${fileName}${groupLabel} (${percent}%)`;
   }
 
   if (fileName) {
-    return `Loading ${fileName}…`;
+    return `Loading ${fileName}${groupLabel}…`;
   }
 
   if (typeof info.phase === "string" && info.phase.trim()) {

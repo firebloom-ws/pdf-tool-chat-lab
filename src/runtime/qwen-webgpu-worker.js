@@ -10,6 +10,7 @@ let tensorbendModulesPromise = null;
 
 const decoder = new TextDecoder();
 const packedCache = new TensorbendPackedCache(CACHE_NAMESPACE);
+const MAX_PENDING_CACHE_WRITES = 2;
 
 const runtime = {
   modelId: MODEL_ID,
@@ -41,7 +42,9 @@ function hubFileUrl(repo, path, revision = DEFAULT_REVISION) {
 }
 
 async function fetchText(repo, path, revision = DEFAULT_REVISION, { optional = false } = {}) {
-  const response = await fetch(hubFileUrl(repo, path, revision));
+  const response = await fetch(hubFileUrl(repo, path, revision), {
+    cache: "no-store"
+  });
   if (!response.ok) {
     if (optional && response.status === 404) {
       return null;
@@ -54,18 +57,6 @@ async function fetchText(repo, path, revision = DEFAULT_REVISION, { optional = f
 async function fetchJson(repo, path, revision = DEFAULT_REVISION, options = {}) {
   const text = await fetchText(repo, path, revision, options);
   return text ? JSON.parse(text) : null;
-}
-
-async function headFileSize(repo, path, revision = DEFAULT_REVISION) {
-  try {
-    const response = await fetch(hubFileUrl(repo, path, revision), { method: "HEAD" });
-    if (!response.ok) {
-      return 0;
-    }
-    return Number(response.headers.get("content-length") ?? 0);
-  } catch {
-    return 0;
-  }
 }
 
 function installTensorbendDomShims() {
@@ -116,9 +107,9 @@ function chooseContextLength(gpuInfo) {
   const maxBufferSize = Number(gpuInfo?.limits?.maxBufferSize ?? 0);
   const largeGpu = maxBufferSize >= 3_500_000_000;
   const mediumGpu = maxBufferSize >= 2_500_000_000;
-  if (largeGpu) return 4096;
-  if (mediumGpu) return 3072;
-  return 2048;
+  if (largeGpu) return 2048;
+  if (mediumGpu) return 1536;
+  return 1024;
 }
 
 function assignSamplingDefaults(model) {
@@ -175,48 +166,27 @@ async function listSafetensorFiles(repo, revision = DEFAULT_REVISION) {
   return ["model.safetensors"];
 }
 
-function parseSafetensorsBytes(bytes) {
-  const payload = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
-  const headerLength =
-    view.getUint32(0, true) + view.getUint32(4, true) * 2 ** 32;
-  const headerStart = 8;
-  const headerEnd = headerStart + headerLength;
-  const header = JSON.parse(decoder.decode(payload.subarray(headerStart, headerEnd)));
-  const dataOffset = headerEnd;
-  const shard = {};
-
-  for (const [name, spec] of Object.entries(header)) {
-    if (name === "__metadata__") {
-      continue;
+async function fetchRangeBytes(repo, path, revision, start, end, { onProgress } = {}) {
+  const response = await fetch(hubFileUrl(repo, path, revision), {
+    cache: "no-store",
+    headers: {
+      Range: `bytes=${start}-${Math.max(start, end - 1)}`
     }
+  });
 
-    const [start, end] = spec.data_offsets ?? [0, 0];
-    shard[name] = {
-      dtype: spec.dtype,
-      shape: Array.isArray(spec.shape) ? spec.shape.map((value) => Number(value)) : [],
-      data: payload.subarray(dataOffset + start, dataOffset + end)
-    };
+  if (!response.ok && response.status !== 206) {
+    throw new Error(`Failed to fetch range for ${path}: ${response.status}`);
   }
 
-  return shard;
-}
-
-async function downloadFileBytes(repo, path, revision, { onProgress } = {}) {
-  const response = await fetch(hubFileUrl(repo, path, revision));
-  if (!response.ok) {
-    throw new Error(`Failed to fetch ${path}: ${response.status}`);
-  }
-
-  const total = Number(response.headers.get("content-length") ?? 0);
   if (!response.body) {
     const bytes = new Uint8Array(await response.arrayBuffer());
-    onProgress?.({ loaded: bytes.byteLength, total: total || bytes.byteLength });
+    onProgress?.({ loaded: bytes.byteLength, total: end - start });
     return bytes;
   }
 
   const reader = response.body.getReader();
-  const chunks = [];
+  const total = end - start;
+  const bytes = new Uint8Array(total);
   let loaded = 0;
 
   while (true) {
@@ -224,36 +194,104 @@ async function downloadFileBytes(repo, path, revision, { onProgress } = {}) {
     if (done) {
       break;
     }
-    chunks.push(value);
+    bytes.set(value, loaded);
     loaded += value.byteLength;
     onProgress?.({ loaded, total });
   }
 
-  if (total > 0 && loaded === total) {
-    const bytes = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return bytes;
-  }
-
-  const bytes = new Uint8Array(loaded);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
+  return loaded === total ? bytes : bytes.slice(0, loaded);
 }
 
-async function estimateTotalBytes(repo, files, revision) {
-  let total = 0;
-  for (const path of files) {
-    total += await headFileSize(repo, path, revision);
+async function readSafetensorsHeader(repo, path, revision = DEFAULT_REVISION) {
+  const prefix = await fetchRangeBytes(repo, path, revision, 0, 8);
+  const view = new DataView(prefix.buffer, prefix.byteOffset, prefix.byteLength);
+  const low = view.getUint32(0, true);
+  const high = view.getUint32(4, true);
+  const headerLength = low + high * 2 ** 32;
+  const headerBytes = await fetchRangeBytes(repo, path, revision, 8, 8 + headerLength);
+  const header = JSON.parse(decoder.decode(headerBytes));
+  return {
+    header,
+    dataOffset: 8 + headerLength
+  };
+}
+
+function collectTensorEntries(header, dataOffset) {
+  const entries = [];
+  for (const [name, spec] of Object.entries(header ?? {})) {
+    if (name === "__metadata__") {
+      continue;
+    }
+    const [start, end] = spec.data_offsets ?? [0, 0];
+    entries.push({
+      name,
+      dtype: spec.dtype,
+      shape: Array.isArray(spec.shape) ? spec.shape.map((value) => Number(value)) : [],
+      absStart: dataOffset + start,
+      absEnd: dataOffset + end,
+      byteLength: end - start
+    });
   }
-  return total;
+  return entries.sort((left, right) => left.absStart - right.absStart);
+}
+
+function buildDownloadGroups(entries, maxGroupBytes = 48 * 1024 * 1024, maxGapBytes = 1 * 1024 * 1024) {
+  const groups = [];
+  let current = null;
+
+  for (const entry of entries) {
+    if (!current) {
+      current = {
+        start: entry.absStart,
+        end: entry.absEnd,
+        tensors: [entry]
+      };
+      continue;
+    }
+
+    const proposedEnd = entry.absEnd;
+    const proposedSize = proposedEnd - current.start;
+    const gap = entry.absStart - current.end;
+
+    if (
+      (proposedSize > maxGroupBytes && current.tensors.length > 0) ||
+      gap > maxGapBytes
+    ) {
+      groups.push(current);
+      current = {
+        start: entry.absStart,
+        end: entry.absEnd,
+        tensors: [entry]
+      };
+      continue;
+    }
+
+    current.end = proposedEnd;
+    current.tensors.push(entry);
+  }
+
+  if (current) {
+    groups.push(current);
+  }
+
+  return groups.map((group, index) => ({
+    ...group,
+    groupIndex: index,
+    byteLength: group.end - group.start
+  }));
+}
+
+function buildShardFromGroup(bytes, group) {
+  const shard = {};
+  for (const tensor of group.tensors) {
+    const offset = tensor.absStart - group.start;
+    shard[tensor.name] = {
+      dtype: tensor.dtype,
+      shape: tensor.shape,
+      data: bytes.subarray(offset, offset + tensor.byteLength)
+    };
+  }
+  return shard;
 }
 
 function truncatePromptTokens(tokenIds, contextLength, maxNewTokens) {
@@ -307,58 +345,108 @@ async function hydrateFromPackedCache(model, modelId, revision, manifest) {
 
 async function streamAndCachePackedWeights(model, modelId, revision) {
   const files = await listSafetensorFiles(modelId, revision);
-  const totalBytes = await estimateTotalBytes(modelId, files, revision);
+  const filePlans = [];
+  let totalBytes = 0;
+  let totalGroups = 0;
+
+  for (const path of files) {
+    const { header, dataOffset } = await readSafetensorsHeader(modelId, path, revision);
+    const entries = collectTensorEntries(header, dataOffset);
+    const groups = buildDownloadGroups(entries);
+    filePlans.push({ path, groups });
+    totalBytes += groups.reduce((sum, group) => sum + group.byteLength, 0);
+    totalGroups += groups.length;
+  }
+
   let loadedBytes = 0;
   const shards = [];
+  let globalShardIndex = 0;
+  let completedGroups = 0;
+  const pendingWrites = [];
 
-  for (let index = 0; index < files.length; index += 1) {
-    const path = files[index];
-    const bytes = await downloadFileBytes(modelId, path, revision, {
-      onProgress: ({ loaded, total }) => {
-        const resolvedTotal = totalBytes || loadedBytes + (total || loaded);
-        post("load-progress", {
-          phase: "weights",
-          info: {
-            status: "streaming_quantized_weights",
-            file: path,
-            loaded: loadedBytes + loaded,
-            total: resolvedTotal,
-            progress:
-              resolvedTotal > 0 ? (loadedBytes + loaded) / resolvedTotal : null
+  const flushPendingWrites = async (limit = 0) => {
+    while (pendingWrites.length > limit) {
+      const next = pendingWrites.shift();
+      const result = await next;
+      shards[result.shardIndex] = result.shardInfo;
+    }
+  };
+
+  for (const filePlan of filePlans) {
+    for (const group of filePlan.groups) {
+      const bytes = await fetchRangeBytes(
+        modelId,
+        filePlan.path,
+        revision,
+        group.start,
+        group.end,
+        {
+          onProgress: ({ loaded, total }) => {
+            post("load-progress", {
+              phase: "weights",
+              info: {
+                status: "streaming_quantized_weights",
+                file: filePlan.path,
+                loaded: loadedBytes + loaded,
+                total: totalBytes,
+                progress: totalBytes > 0 ? (loadedBytes + loaded) / totalBytes : null,
+                group: completedGroups + 1,
+                totalGroups
+              }
+            });
           }
-        });
-      }
-    });
+        }
+      );
 
-    const shard = parseSafetensorsBytes(bytes);
-    model.uploadTensors(shard);
+      const shard = buildShardFromGroup(bytes, group);
+      model.uploadTensors(shard);
 
-    const packed = await packedCache.writeShard(modelId, revision, index, shard, { path });
-    shards.push({
-      shardIndex: index,
-      path,
-      tensorCount: packed.tensorCount,
-      byteLength: packed.byteLength
-    });
+      const shardIndex = globalShardIndex;
+      pendingWrites.push(
+        packedCache
+          .writeShard(modelId, revision, shardIndex, shard, {
+            path: filePlan.path,
+            rangeStart: group.start,
+            rangeEnd: group.end
+          })
+          .then((packed) => ({
+            shardIndex,
+            shardInfo: {
+              shardIndex,
+              path: filePlan.path,
+              rangeStart: group.start,
+              rangeEnd: group.end,
+              tensorCount: packed.tensorCount,
+              byteLength: packed.byteLength
+            }
+          }))
+      );
+      await flushPendingWrites(MAX_PENDING_CACHE_WRITES - 1);
 
-    loadedBytes += bytes.byteLength;
+      globalShardIndex += 1;
+      loadedBytes += group.byteLength;
+      completedGroups += 1;
 
-    post("load-progress", {
-      phase: "cache",
-      info: {
-        status: "packing_quantized_cache",
-        file: path,
-        loaded: loadedBytes,
-        total: totalBytes || loadedBytes,
-        progress:
-          (totalBytes || loadedBytes) > 0 ? loadedBytes / (totalBytes || loadedBytes) : null
-      }
-    });
+      post("load-progress", {
+        phase: "cache",
+        info: {
+          status: "packing_quantized_cache",
+          file: filePlan.path,
+          loaded: loadedBytes,
+          total: totalBytes,
+          progress: totalBytes > 0 ? loadedBytes / totalBytes : null,
+          group: completedGroups,
+          totalGroups
+        }
+      });
+    }
   }
+
+  await flushPendingWrites();
 
   const manifest = {
     source: "hf-stream",
-    shards,
+    shards: shards.filter(Boolean),
     totalBytes
   };
 
@@ -404,12 +492,25 @@ async function handleLoad({ modelId = MODEL_ID, gpuInfo, revision = DEFAULT_REVI
   ]);
 
   post("load-progress", {
+    phase: "config",
+    info: {
+      status: manifest?.shards?.length ? "restoring_cached_model_plan" : "planning_weight_stream",
+      progress: 0.06
+    }
+  });
+
+  post("load-progress", {
     phase: "runtime",
     info: { status: "initializing_webgpu", progress: 0.08 }
   });
 
   const gpu = new GpuOps();
   await gpu.init();
+
+  post("load-progress", {
+    phase: "runtime",
+    info: { status: "compiling_tensorbend_pipelines", progress: 0.1 }
+  });
 
   const model = new Qwen35Model(gpu, config, quantConfig);
   assignSamplingDefaults(model);
@@ -418,6 +519,10 @@ async function handleLoad({ modelId = MODEL_ID, gpuInfo, revision = DEFAULT_REVI
   let cacheManifest = manifest;
 
   if (cacheManifest?.shards?.length) {
+    post("load-progress", {
+      phase: "cache",
+      info: { status: "restoring_quantized_cache", progress: 0.14 }
+    });
     try {
       await hydrateFromPackedCache(model, resolvedModelId, revision, cacheManifest);
     } catch (error) {
@@ -438,12 +543,20 @@ async function handleLoad({ modelId = MODEL_ID, gpuInfo, revision = DEFAULT_REVI
   post("load-progress", {
     phase: "weights",
     info: {
-      status: "post_processing",
+      status: "post_processing_weights",
       progress: 0.97
     }
   });
 
   await model.postProcessWeights();
+
+  post("load-progress", {
+    phase: "runtime",
+    info: {
+      status: "allocating_runtime_buffers",
+      progress: 0.99
+    }
+  });
 
   const contextLength = chooseContextLength(gpuInfo);
   model.initBuffers(contextLength);
