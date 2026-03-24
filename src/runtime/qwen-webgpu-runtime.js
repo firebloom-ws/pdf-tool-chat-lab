@@ -1,31 +1,33 @@
-const QWEN_TRANSFORMERS_CDN =
-  "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.0.0-next.8";
+const QWEN_MODEL_ALIASES = {
+  "onnx-community/Qwen3.5-0.8B-ONNX": "Qwen/Qwen3.5-0.8B",
+  "onnx-community/Qwen3.5-2B-ONNX": "Qwen/Qwen3.5-2B"
+};
 
 export const QWEN_WEBGPU_MODELS = [
   {
-    id: "onnx-community/Qwen3.5-0.8B-ONNX",
+    id: "Qwen/Qwen3.5-0.8B",
     label: "0.8B",
-    description: "Smallest local WebGPU model"
+    description: "Smallest Tensorbend WebGPU model"
   },
   {
-    id: "onnx-community/Qwen3.5-2B-ONNX",
+    id: "Qwen/Qwen3.5-2B",
     label: "2B",
-    description: "Stronger answers, slower downloads"
-  },
-  {
-    id: "onnx-community/Qwen3.5-4B-ONNX",
-    label: "4B",
-    description: "Largest browser option"
+    description: "Stronger answers, larger download"
   }
 ];
 
 export const DEFAULT_QWEN_WEBGPU_MODEL = QWEN_WEBGPU_MODELS[0].id;
 
+function normalizeModelId(modelId) {
+  return QWEN_MODEL_ALIASES[modelId] ?? modelId ?? DEFAULT_QWEN_WEBGPU_MODEL;
+}
+
 function modelLabelFor(modelId) {
+  const normalized = normalizeModelId(modelId);
   return (
-    QWEN_WEBGPU_MODELS.find((model) => model.id === modelId)?.label ??
-    modelId.split("/").at(-1) ??
-    modelId
+    QWEN_WEBGPU_MODELS.find((model) => model.id === normalized)?.label ??
+    normalized.split("/").at(-1) ??
+    normalized
   );
 }
 
@@ -58,17 +60,40 @@ function summarizeProgress(info, phase = "model") {
     return `Loading ${fileName}…`;
   }
 
+  if (typeof info.phase === "string" && info.phase.trim()) {
+    return `${phase}: ${info.phase.replace(/_/g, " ")}`;
+  }
+
   if (typeof info.status === "string" && info.status.trim()) {
     return `${phase}: ${info.status.replace(/_/g, " ")}`;
+  }
+
+  if (percent !== null) {
+    return `Preparing ${phase} (${percent}%)`;
   }
 
   return `Preparing ${phase}…`;
 }
 
+function describeReadyDetail(message, fallbackLabel, fallbackDtype) {
+  const label = modelLabelFor(message.modelId ?? fallbackLabel);
+  const dtype = message.dtype ?? fallbackDtype ?? "bf16/f16";
+  const contextLength = Number(message.contextLength);
+  if (Number.isFinite(contextLength) && contextLength > 0) {
+    return `${label} loaded on WebGPU via Tensorbend (${dtype}, ${contextLength}-token context).`;
+  }
+  return `${label} loaded on WebGPU via Tensorbend (${dtype}).`;
+}
+
 export class QwenWebGpuTextRuntime {
-  constructor({ webgpuRuntime, modelId = DEFAULT_QWEN_WEBGPU_MODEL } = {}) {
+  constructor({
+    webgpuRuntime,
+    hubClient,
+    modelId = DEFAULT_QWEN_WEBGPU_MODEL
+  } = {}) {
     this.webgpuRuntime = webgpuRuntime;
-    this.modelId = modelId;
+    this.hubClient = hubClient;
+    this.modelId = normalizeModelId(modelId);
     this.supportsLoraWeightInjection = false;
     this.worker = null;
     this.listeners = new Set();
@@ -77,15 +102,14 @@ export class QwenWebGpuTextRuntime {
     this.loadPromise = null;
     this.requestCounter = 0;
     this.state = {
-      backend: "transformers.js/webgpu",
-      cdn: QWEN_TRANSFORMERS_CDN,
-      modelId,
-      label: modelLabelFor(modelId),
+      backend: "tensorbend/webgpu",
+      modelId: this.modelId,
+      label: modelLabelFor(this.modelId),
       status: "idle",
       ready: false,
       dtype: null,
       progress: 0,
-      detail: `${modelLabelFor(modelId)} is not loaded yet.`,
+      detail: `${modelLabelFor(this.modelId)} is not loaded yet.`,
       error: null
     };
   }
@@ -107,21 +131,22 @@ export class QwenWebGpuTextRuntime {
   }
 
   setModel(modelId) {
-    if (!modelId || modelId === this.modelId) {
+    const normalized = normalizeModelId(modelId);
+    if (!normalized || normalized === this.modelId) {
       return;
     }
 
-    this.modelId = modelId;
+    this.modelId = normalized;
     this.#disposeWorker();
     this.#updateState({
-      modelId,
-      label: modelLabelFor(modelId),
+      modelId: normalized,
+      label: modelLabelFor(normalized),
       status: "idle",
       ready: false,
       dtype: null,
       progress: 0,
       error: null,
-      detail: `${modelLabelFor(modelId)} is not loaded yet.`
+      detail: `${modelLabelFor(normalized)} is not loaded yet.`
     });
   }
 
@@ -155,17 +180,16 @@ export class QwenWebGpuTextRuntime {
       return this.loadPromise;
     }
 
-    const dtype = gpuInfo.fp16Supported ? "q4f16" : "q4";
     const worker = this.#ensureWorker();
     this.#updateState({
       modelId: this.modelId,
       label: modelLabelFor(this.modelId),
       status: "loading",
       ready: false,
-      dtype,
+      dtype: null,
       progress: 0,
       error: null,
-      detail: `Loading ${modelLabelFor(this.modelId)} on WebGPU…`
+      detail: `Loading ${modelLabelFor(this.modelId)} with Tensorbend…`
     });
 
     this.loadPromise = new Promise((resolve, reject) => {
@@ -174,7 +198,7 @@ export class QwenWebGpuTextRuntime {
         type: "load",
         data: {
           modelId: this.modelId,
-          dtype
+          gpuInfo
         }
       });
     }).finally(() => {
@@ -197,6 +221,15 @@ export class QwenWebGpuTextRuntime {
       throw new Error("generation-in-progress");
     }
 
+    if (!this.hubClient) {
+      throw new Error("hub-client-unavailable");
+    }
+
+    const prompt = await this.hubClient.renderChatPrompt(this.modelId, messages, {
+      add_generation_prompt: true,
+      enable_thinking: false
+    });
+
     const worker = this.#ensureWorker();
     const requestId = ++this.requestCounter;
 
@@ -211,7 +244,7 @@ export class QwenWebGpuTextRuntime {
         type: "generate",
         data: {
           requestId,
-          messages,
+          prompt,
           maxNewTokens
         }
       });
@@ -276,7 +309,7 @@ export class QwenWebGpuTextRuntime {
           status: "loading",
           ready: false,
           dtype: message.dtype ?? this.state.dtype,
-          detail: `Loading ${modelLabelFor(message.modelId ?? this.modelId)} on WebGPU…`
+          detail: `Loading ${modelLabelFor(message.modelId ?? this.modelId)} with Tensorbend…`
         });
         break;
       }
@@ -295,15 +328,21 @@ export class QwenWebGpuTextRuntime {
       }
 
       case "load-ready": {
+        const detail = describeReadyDetail(
+          message,
+          message.modelId ?? this.modelId,
+          this.state.dtype
+        );
         this.#updateState({
           modelId: message.modelId ?? this.modelId,
           label: modelLabelFor(message.modelId ?? this.modelId),
           status: "ready",
           ready: true,
-          dtype: message.dtype ?? this.state.dtype,
+          dtype: message.dtype ?? this.state.dtype ?? "bf16/f16",
           progress: 100,
           error: null,
-          detail: `${modelLabelFor(message.modelId ?? this.modelId)} loaded on WebGPU (${message.dtype ?? this.state.dtype}).`
+          detail,
+          backend: message.backend ?? this.state.backend
         });
         if (this.pendingLoad) {
           this.pendingLoad.resolve({
@@ -359,13 +398,22 @@ export class QwenWebGpuTextRuntime {
             outputTokens: message.outputTokens ?? null,
             maxNewTokens: message.maxNewTokens ?? null,
             hitTokenLimit: Boolean(message.hitTokenLimit),
-            modelId: this.state.modelId
+            modelId: this.state.modelId,
+            truncatedPromptTokens: message.truncatedPromptTokens ?? 0
           });
           this.pendingGeneration = null;
         }
         this.#updateState({
           status: "ready",
-          detail: `${this.state.label} loaded on WebGPU (${this.state.dtype}).`
+          detail: describeReadyDetail(
+            {
+              modelId: this.state.modelId,
+              dtype: this.state.dtype,
+              contextLength: message.contextLength
+            },
+            this.state.modelId,
+            this.state.dtype
+          )
         });
         break;
       }
@@ -381,7 +429,15 @@ export class QwenWebGpuTextRuntime {
         }
         this.#updateState({
           status: "ready",
-          detail: `${this.state.label} loaded on WebGPU (${this.state.dtype}).`
+          detail: describeReadyDetail(
+            {
+              modelId: this.state.modelId,
+              dtype: this.state.dtype,
+              contextLength: message.contextLength
+            },
+            this.state.modelId,
+            this.state.dtype
+          )
         });
         break;
       }
@@ -390,7 +446,15 @@ export class QwenWebGpuTextRuntime {
         this.#updateState({
           status: this.state.ready ? "ready" : this.state.status,
           detail: this.state.ready
-            ? `${this.state.label} loaded on WebGPU (${this.state.dtype}).`
+            ? describeReadyDetail(
+                {
+                  modelId: this.state.modelId,
+                  dtype: this.state.dtype,
+                  contextLength: message.contextLength
+                },
+                this.state.modelId,
+                this.state.dtype
+              )
             : this.state.detail
         });
         break;

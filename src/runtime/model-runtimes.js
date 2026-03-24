@@ -776,6 +776,7 @@ export class QwenToolRuntime {
     this.webgpuRuntime = webgpuRuntime;
     this.textRuntime = new QwenWebGpuTextRuntime({
       webgpuRuntime,
+      hubClient,
       modelId: DEFAULT_QWEN_WEBGPU_MODEL
     });
     this.toolRegistry = null;

@@ -61,19 +61,33 @@ export const MAX_CHARS_PER_CHUNK = 2048;
  * head_dim is derived if absent.
  */
 const QWEN35_CONFIGS = {
+  "Qwen/Qwen3.5-0.8B": {
+    hidden_size: 1024,
+    num_hidden_layers: 24,
+    num_attention_heads: 8,
+    num_key_value_heads: 2,
+    head_dim: 256
+  },
+  "Qwen/Qwen3.5-2B": {
+    hidden_size: 2048,
+    num_hidden_layers: 24,
+    num_attention_heads: 8,
+    num_key_value_heads: 2,
+    head_dim: 256
+  },
   "onnx-community/Qwen3.5-0.8B-ONNX": {
     hidden_size: 1024,
-    num_hidden_layers: 28,
-    num_attention_heads: 16,
-    num_key_value_heads: 8,
-    head_dim: 64
+    num_hidden_layers: 24,
+    num_attention_heads: 8,
+    num_key_value_heads: 2,
+    head_dim: 256
   },
   "onnx-community/Qwen3.5-2B-ONNX": {
-    hidden_size: 1536,
-    num_hidden_layers: 28,
-    num_attention_heads: 16,
-    num_key_value_heads: 8,
-    head_dim: 96
+    hidden_size: 2048,
+    num_hidden_layers: 24,
+    num_attention_heads: 8,
+    num_key_value_heads: 2,
+    head_dim: 256
   },
   "onnx-community/Qwen3.5-4B-ONNX": {
     hidden_size: 2560,
@@ -85,7 +99,7 @@ const QWEN35_CONFIGS = {
 };
 
 export function resolveModelConfig(modelId) {
-  return QWEN35_CONFIGS[modelId] ?? QWEN35_CONFIGS["onnx-community/Qwen3.5-0.8B-ONNX"];
+  return QWEN35_CONFIGS[modelId] ?? QWEN35_CONFIGS["Qwen/Qwen3.5-0.8B"];
 }
 
 // ─── Math utilities ───────────────────────────────────────────────────────────
@@ -386,15 +400,15 @@ function combineAdapters(chunkedAdapters) {
   return combined;
 }
 
-// ─── Memory prompt generation (transformers.js fallback) ─────────────────────
+// ─── Memory prompt generation (browser runtime fallback) ─────────────────────
 
 /**
- * Build a compact document profile for the transformers.js ONNX path.
+ * Build a compact document profile for the shipped browser runtime.
  *
- * Since the ONNX model can't have weights patched at runtime, we inject
- * the document encoding as a compressed system-level summary. This gives
- * the model a bounded, reusable document profile without the token cost of
- * replaying the full document on every turn.
+ * Since the active WebGPU worker path still cannot patch generated weights
+ * into the live model, we inject the document encoding as a compressed
+ * system-level summary. This gives the model a bounded, reusable document
+ * profile without the token cost of replaying the full document on every turn.
  *
  * @param {Array} metaGroups  — array of chunk arrays
  * @param {string} title      — document title
@@ -434,7 +448,7 @@ function buildMemoryPrompt(metaGroups, title) {
  * - Per-layer A, B matrices for Q/K/V/O attention projections
  *   (used by Qwen35TextEngine when injecting into custom JS forward pass)
  * - A compressed document profile prompt
- *   (used by the transformers.js path as an additional system prefix)
+ *   (used by the active browser runtime as an additional system prefix)
  */
 export class DocToLoraAdapter {
   constructor({ layers, rank, scale, numGroups, title, encodingMs, memoryPrompt, mode = "document-profile" }) {
@@ -499,7 +513,7 @@ export class DocToLoraAdapter {
  * Usage:
  *   const encoder = new DocToLoraEncoder();
  *   const unsub = encoder.subscribe(state => updateUI(state));
- *   const adapter = await encoder.encode(index, "onnx-community/Qwen3.5-0.8B-ONNX", { title });
+ *   const adapter = await encoder.encode(index, "Qwen/Qwen3.5-0.8B", { title });
  *   engine.setLoraAdapter(adapter);
  */
 export class DocToLoraEncoder {
@@ -540,7 +554,7 @@ export class DocToLoraEncoder {
    * Encode a document index into either adapter weights or a document profile.
    *
    * @param {Object} index       — from buildDocumentIndex: { chunks, pages }
-   * @param {string} modelId     — e.g. "onnx-community/Qwen3.5-0.8B-ONNX"
+   * @param {string} modelId     — e.g. "Qwen/Qwen3.5-0.8B"
    * @param {Object} options
    * @param {string} [options.title]      — document title for labelling
    * @param {Function} [options.onProgress] — (fraction 0–1, message) callback
