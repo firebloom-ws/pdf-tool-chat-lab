@@ -973,6 +973,8 @@ export class QwenToolRuntime {
         text:
           (modelState.status === "loading"
             ? `Qwen ${modelState.label} is still loading on WebGPU, so this answer uses retrieval only for now.\n\n`
+            : modelState.status === "parked"
+              ? `Qwen ${modelState.label} has only completed custom-kernel and checkpoint analysis so far, so this answer uses retrieval only for now.\n\n`
             : modelState.status === "error"
               ? `Qwen failed to load (${modelState.error}), so this answer uses retrieval only.\n\n`
               : "Qwen is not loaded yet, so this answer uses retrieval only.\n\n") +
@@ -1017,6 +1019,9 @@ export class QwenToolRuntime {
           onPartial: (partialText) => {
             const merged = mergeContinuationText(accumulatedText, partialText);
             options.onPartial?.(merged);
+          },
+          onStatus: (detail) => {
+            options.onProgress?.(detail);
           }
         });
         finalGeneration = generated;
@@ -1029,6 +1034,9 @@ export class QwenToolRuntime {
         accumulatedText = mergeContinuationText(accumulatedText, generated.text ?? "");
 
         if (!(generated.text?.trim())) {
+          trace.push(
+            `qwen.generate(empty-output: tokens=${generated.outputTokens ?? 0}, stop=${generated.stopTokenId ?? "none"}, first=[${(generated.firstTokenIds ?? []).join(",")}], raw=${JSON.stringify(generated.rawTextPreview ?? "").slice(0, 120)})`
+          );
           break;
         }
 

@@ -31,6 +31,7 @@ export class HfHubClient {
   constructor() {
     this.cache = new OpfsCache("papertrail-lab");
     this.listCache = new Map();
+    this.chatTemplateCache = new Map();
   }
 
   async fetchBlob(repo, path, { cache = true, type = "" } = {}) {
@@ -123,18 +124,20 @@ export class HfHubClient {
   }
 
   async loadTokenizerBundle(repo) {
-    const [tokenizerConfig, tokenizerJson, vocabJson, mergesText] = await Promise.all([
+    const [tokenizerConfig, tokenizerJson, vocabJson, mergesText, chatTemplate] = await Promise.all([
       this.fetchJson(repo, "tokenizer_config.json"),
       this.fetchJson(repo, "tokenizer.json"),
       this.fetchJson(repo, "vocab.json"),
-      this.fetchText(repo, "merges.txt")
+      this.fetchText(repo, "merges.txt"),
+      this.fetchText(repo, "chat_template.jinja")
     ]);
 
     return {
       tokenizerConfig,
       tokenizerJson,
       vocabJson,
-      mergesText
+      mergesText,
+      chatTemplate
     };
   }
 
@@ -142,12 +145,38 @@ export class HfHubClient {
     return inspectModelSafetensors(this, repo);
   }
 
+  async loadChatTemplate(repo) {
+    if (this.chatTemplateCache.has(repo)) {
+      return this.chatTemplateCache.get(repo);
+    }
+
+    const promise = (async () => {
+      const [tokenizerConfig, chatTemplateFile] = await Promise.all([
+        this.fetchJson(repo, "tokenizer_config.json"),
+        this.fetchText(repo, "chat_template.jinja")
+      ]);
+      return chatTemplateFile ?? tokenizerConfig?.chat_template ?? null;
+    })();
+
+    this.chatTemplateCache.set(repo, promise);
+    try {
+      return await promise;
+    } catch (error) {
+      this.chatTemplateCache.delete(repo);
+      throw error;
+    }
+  }
+
   async renderChatPrompt(repo, messages, extraContext = {}) {
-    const tokenizerConfig = await this.fetchJson(repo, "tokenizer_config.json");
-    if (tokenizerConfig?.chat_template) {
+    const [tokenizerConfig, chatTemplate] = await Promise.all([
+      this.fetchJson(repo, "tokenizer_config.json"),
+      this.loadChatTemplate(repo)
+    ]);
+
+    if (chatTemplate) {
       try {
         const { Template } = await loadJinjaModule();
-        const template = new Template(tokenizerConfig.chat_template);
+        const template = new Template(chatTemplate);
         return template.render({
           messages,
           bos_token: tokenizerConfig.bos_token ?? "",

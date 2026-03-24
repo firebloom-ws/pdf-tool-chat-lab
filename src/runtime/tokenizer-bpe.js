@@ -1,6 +1,26 @@
 const GPT2_PATTERN =
   /'(?:[sdmt]|ll|ve|re)| ?[\p{L}]+| ?[\p{N}]+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+/gu;
 
+function compilePretokenizePattern(tokenizerConfig = {}) {
+  const rawPattern = tokenizerConfig?.pretokenize_regex;
+  if (typeof rawPattern !== "string" || !rawPattern.trim()) {
+    return GPT2_PATTERN;
+  }
+
+  // Hugging Face tokenizer configs can use inline case-insensitive groups like
+  // `(?i:...)`, which are not supported by JavaScript RegExp. We conservatively
+  // lift that to a global `i` flag and keep the original pattern otherwise.
+  const normalizedPattern = rawPattern.replaceAll("(?i:", "(?:");
+  const flags = rawPattern.includes("(?i:") ? "giu" : "gu";
+
+  try {
+    return new RegExp(normalizedPattern, flags);
+  } catch (error) {
+    console.warn("Falling back to the GPT-2 pretokenizer regex.", error);
+    return GPT2_PATTERN;
+  }
+}
+
 function bytesToUnicode() {
   const bs = [];
   for (let code = 33; code <= 126; code += 1) bs.push(code);
@@ -73,7 +93,7 @@ export class BytePairTokenizer {
     this.specialTokens = new Map();
     this.specialTokenRegex = null;
     this.cache = new Map();
-    this.pattern = GPT2_PATTERN;
+    this.pattern = compilePretokenizePattern(tokenizerConfig);
     this.tokenizerConfig = tokenizerConfig;
 
     for (const token of addedTokens) {

@@ -1,29 +1,35 @@
 import { BytePairTokenizer } from "./tokenizer-bpe.js";
-import { TensorbendPackedCache } from "./tensorbend-packed-cache.js";
+import {
+  analyzeCustomQwenBackend,
+  CUSTOM_QWEN_BACKEND,
+  formatCustomBackendDetail,
+  PapertrailQwenKernelHarness
+} from "./papertrail-qwen-custom-backend.js";
+import { PapertrailQwenCustomEngine } from "./papertrail-qwen-custom-engine.js";
 
 const MODEL_ID = "Intel/Qwen3.5-2B-int4-AutoRound";
 const DEFAULT_REVISION = "main";
 const DEFAULT_DTYPE = "int4-auto-round";
-const CACHE_NAMESPACE = "papertrail-tensorbend";
 
-let tensorbendModulesPromise = null;
+let kernelModulesPromise = null;
 
 const decoder = new TextDecoder();
-const packedCache = new TensorbendPackedCache(CACHE_NAMESPACE);
-const MAX_PENDING_CACHE_WRITES = 2;
 
 const runtime = {
   modelId: MODEL_ID,
   revision: DEFAULT_REVISION,
   tokenizer: null,
-  model: null,
+  tokenizerConfig: null,
   gpu: null,
+  kernelHarness: null,
+  analysis: null,
   config: null,
   quantConfig: null,
   contextLength: 0,
   interruptRequested: false,
   activeRequestId: null,
-  cacheManifest: null
+  engine: null,
+  generateStatusDetail: null
 };
 
 function post(type, data = {}) {
@@ -59,7 +65,7 @@ async function fetchJson(repo, path, revision = DEFAULT_REVISION, options = {}) 
   return text ? JSON.parse(text) : null;
 }
 
-function installTensorbendDomShims() {
+function installKernelBundleDomShims() {
   if (!globalThis.document) {
     globalThis.document = {
       createElement() {
@@ -89,18 +95,17 @@ function installTensorbendDomShims() {
   }
 }
 
-async function loadTensorbendModules() {
-  if (!tensorbendModulesPromise) {
-    installTensorbendDomShims();
-    tensorbendModulesPromise = Promise.all([
-      import(new URL("./tensorbend/gpu-ops-CgR4iK87.js", import.meta.url).href),
-      import(new URL("./tensorbend/qwen35-model-DHin-Xw8.js", import.meta.url).href)
-    ]).then(([gpuOpsModule, qwenModule]) => ({
+async function loadKernelModules() {
+  if (!kernelModulesPromise) {
+    installKernelBundleDomShims();
+    kernelModulesPromise = import(
+      new URL("./tensorbend/gpu-ops-CgR4iK87.js", import.meta.url).href
+    ).then((gpuOpsModule) => ({
       GpuOps: gpuOpsModule.G,
-      Qwen35Model: qwenModule.Qwen35Model
+      shaders: gpuOpsModule.S ?? {}
     }));
   }
-  return tensorbendModulesPromise;
+  return kernelModulesPromise;
 }
 
 function chooseContextLength(gpuInfo) {
@@ -112,13 +117,28 @@ function chooseContextLength(gpuInfo) {
   return 1024;
 }
 
-function assignSamplingDefaults(model) {
-  model.temperature = 0;
-  model.topK = 1;
-  model.topP = 1;
-  model.repetitionPenalty = 1;
-  model.presencePenalty = 0;
-  model.frequencyPenalty = 0;
+async function inspectManifest(repo, revision = DEFAULT_REVISION) {
+  const files = await listSafetensorFiles(repo, revision);
+  const tensors = [];
+  const shards = [];
+
+  for (const path of files) {
+    const { header, dataOffset } = await readSafetensorsHeader(repo, path, revision);
+    const entries = collectTensorEntries(header, dataOffset).map((entry) => ({
+      ...entry,
+      filePath: path,
+      byteStart: entry.absStart,
+      byteEnd: entry.absEnd
+    }));
+    shards.push({ path, tensorCount: entries.length });
+    tensors.push(...entries);
+  }
+
+  return {
+    shardCount: shards.length,
+    shards,
+    tensors
+  };
 }
 
 async function loadTokenizer(repo, revision = DEFAULT_REVISION) {
@@ -129,12 +149,15 @@ async function loadTokenizer(repo, revision = DEFAULT_REVISION) {
     fetchText(repo, "merges.txt", revision, { optional: true })
   ]);
 
-  return BytePairTokenizer.fromModelBundle({
+  return {
     tokenizerConfig,
-    tokenizerJson,
-    vocabJson,
-    mergesText
-  });
+    tokenizer: BytePairTokenizer.fromModelBundle({
+      tokenizerConfig,
+      tokenizerJson,
+      vocabJson,
+      mergesText
+    })
+  };
 }
 
 async function loadQuantConfig(repo, revision, config = null) {
@@ -235,65 +258,6 @@ function collectTensorEntries(header, dataOffset) {
   return entries.sort((left, right) => left.absStart - right.absStart);
 }
 
-function buildDownloadGroups(entries, maxGroupBytes = 48 * 1024 * 1024, maxGapBytes = 1 * 1024 * 1024) {
-  const groups = [];
-  let current = null;
-
-  for (const entry of entries) {
-    if (!current) {
-      current = {
-        start: entry.absStart,
-        end: entry.absEnd,
-        tensors: [entry]
-      };
-      continue;
-    }
-
-    const proposedEnd = entry.absEnd;
-    const proposedSize = proposedEnd - current.start;
-    const gap = entry.absStart - current.end;
-
-    if (
-      (proposedSize > maxGroupBytes && current.tensors.length > 0) ||
-      gap > maxGapBytes
-    ) {
-      groups.push(current);
-      current = {
-        start: entry.absStart,
-        end: entry.absEnd,
-        tensors: [entry]
-      };
-      continue;
-    }
-
-    current.end = proposedEnd;
-    current.tensors.push(entry);
-  }
-
-  if (current) {
-    groups.push(current);
-  }
-
-  return groups.map((group, index) => ({
-    ...group,
-    groupIndex: index,
-    byteLength: group.end - group.start
-  }));
-}
-
-function buildShardFromGroup(bytes, group) {
-  const shard = {};
-  for (const tensor of group.tensors) {
-    const offset = tensor.absStart - group.start;
-    shard[tensor.name] = {
-      dtype: tensor.dtype,
-      shape: tensor.shape,
-      data: bytes.subarray(offset, offset + tensor.byteLength)
-    };
-  }
-  return shard;
-}
-
 function truncatePromptTokens(tokenIds, contextLength, maxNewTokens) {
   const promptBudget = Math.max(32, contextLength - Math.max(1, maxNewTokens));
   if (tokenIds.length <= promptBudget) {
@@ -316,154 +280,19 @@ function truncatePromptTokens(tokenIds, contextLength, maxNewTokens) {
   };
 }
 
-async function hydrateFromPackedCache(model, modelId, revision, manifest) {
-  const shards = [...(manifest?.shards ?? [])].sort(
-    (left, right) => Number(left.shardIndex) - Number(right.shardIndex)
-  );
-
-  for (let index = 0; index < shards.length; index += 1) {
-    const shardInfo = shards[index];
-    const shard = await packedCache.readShard(modelId, revision, shardInfo.shardIndex);
-    if (!shard) {
-      throw new Error(`packed-cache-miss:${shardInfo.shardIndex}`);
-    }
-
-    model.uploadTensors(shard);
-    post("load-progress", {
-      phase: "cache",
-      info: {
-        status: "restoring_quantized_cache",
-        file: shardInfo.path ?? `cached-shard-${index + 1}`,
-        loaded: index + 1,
-        total: shards.length,
-        progress: (index + 1) / Math.max(1, shards.length),
-        cached: true
-      }
-    });
-  }
-}
-
-async function streamAndCachePackedWeights(model, modelId, revision) {
-  const files = await listSafetensorFiles(modelId, revision);
-  const filePlans = [];
-  let totalBytes = 0;
-  let totalGroups = 0;
-
-  for (const path of files) {
-    const { header, dataOffset } = await readSafetensorsHeader(modelId, path, revision);
-    const entries = collectTensorEntries(header, dataOffset);
-    const groups = buildDownloadGroups(entries);
-    filePlans.push({ path, groups });
-    totalBytes += groups.reduce((sum, group) => sum + group.byteLength, 0);
-    totalGroups += groups.length;
-  }
-
-  let loadedBytes = 0;
-  const shards = [];
-  let globalShardIndex = 0;
-  let completedGroups = 0;
-  const pendingWrites = [];
-
-  const flushPendingWrites = async (limit = 0) => {
-    while (pendingWrites.length > limit) {
-      const next = pendingWrites.shift();
-      const result = await next;
-      shards[result.shardIndex] = result.shardInfo;
-    }
-  };
-
-  for (const filePlan of filePlans) {
-    for (const group of filePlan.groups) {
-      const bytes = await fetchRangeBytes(
-        modelId,
-        filePlan.path,
-        revision,
-        group.start,
-        group.end,
-        {
-          onProgress: ({ loaded, total }) => {
-            post("load-progress", {
-              phase: "weights",
-              info: {
-                status: "streaming_quantized_weights",
-                file: filePlan.path,
-                loaded: loadedBytes + loaded,
-                total: totalBytes,
-                progress: totalBytes > 0 ? (loadedBytes + loaded) / totalBytes : null,
-                group: completedGroups + 1,
-                totalGroups
-              }
-            });
-          }
-        }
-      );
-
-      const shard = buildShardFromGroup(bytes, group);
-      model.uploadTensors(shard);
-
-      const shardIndex = globalShardIndex;
-      pendingWrites.push(
-        packedCache
-          .writeShard(modelId, revision, shardIndex, shard, {
-            path: filePlan.path,
-            rangeStart: group.start,
-            rangeEnd: group.end
-          })
-          .then((packed) => ({
-            shardIndex,
-            shardInfo: {
-              shardIndex,
-              path: filePlan.path,
-              rangeStart: group.start,
-              rangeEnd: group.end,
-              tensorCount: packed.tensorCount,
-              byteLength: packed.byteLength
-            }
-          }))
-      );
-      await flushPendingWrites(MAX_PENDING_CACHE_WRITES - 1);
-
-      globalShardIndex += 1;
-      loadedBytes += group.byteLength;
-      completedGroups += 1;
-
-      post("load-progress", {
-        phase: "cache",
-        info: {
-          status: "packing_quantized_cache",
-          file: filePlan.path,
-          loaded: loadedBytes,
-          total: totalBytes,
-          progress: totalBytes > 0 ? loadedBytes / totalBytes : null,
-          group: completedGroups,
-          totalGroups
-        }
-      });
-    }
-  }
-
-  await flushPendingWrites();
-
-  const manifest = {
-    source: "hf-stream",
-    shards: shards.filter(Boolean),
-    totalBytes
-  };
-
-  await packedCache.writeManifest(modelId, revision, manifest);
-  return manifest;
-}
-
 async function handleLoad({ modelId = MODEL_ID, gpuInfo, revision = DEFAULT_REVISION }) {
   const resolvedModelId = MODEL_ID;
 
-  if (runtime.model && runtime.modelId === resolvedModelId && runtime.tokenizer) {
+  if (runtime.engine && runtime.modelId === resolvedModelId) {
     post("load-ready", {
       modelId: resolvedModelId,
       dtype: DEFAULT_DTYPE,
-      backend: "papertrail/tensorbend-webgpu",
+      backend: CUSTOM_QWEN_BACKEND,
       contextLength: runtime.contextLength,
-      cacheMode: runtime.cacheManifest ? "packed-opfs" : "memory"
+      detail: formatCustomBackendDetail(runtime.analysis, {
+        selfTestPassed: runtime.analysis?.selfTest?.ok,
+        decoderReady: true
+      })
     });
     return;
   }
@@ -474,108 +303,81 @@ async function handleLoad({ modelId = MODEL_ID, gpuInfo, revision = DEFAULT_REVI
   post("load-start", {
     modelId: resolvedModelId,
     dtype: DEFAULT_DTYPE,
-    backend: "papertrail/tensorbend-webgpu"
+    backend: CUSTOM_QWEN_BACKEND
   });
 
   post("load-progress", {
     phase: "runtime",
-    info: { status: "bootstrapping_tensorbend_modules", progress: 0.01 }
+    info: { status: "bootstrapping_custom_kernel_modules", progress: 0.04 }
   });
 
-  const { GpuOps, Qwen35Model } = await loadTensorbendModules();
+  const { GpuOps, shaders } = await loadKernelModules();
 
   post("load-progress", {
     phase: "runtime",
-    info: { status: "tensorbend_modules_ready", progress: 0.02 }
+    info: { status: "custom_kernels_ready", progress: 0.08 }
   });
 
   post("load-progress", {
     phase: "config",
-    info: { status: "fetching_config", progress: 0.03 }
+    info: { status: "fetching_config", progress: 0.14 }
   });
 
   const config = await fetchJson(resolvedModelId, "config.json", revision);
-  const [quantConfig, tokenizer, manifest] = await Promise.all([
+  const [quantConfig, tokenizerBundle] = await Promise.all([
     loadQuantConfig(resolvedModelId, revision, config),
-    loadTokenizer(resolvedModelId, revision),
-    packedCache.readManifest(resolvedModelId, revision)
+    loadTokenizer(resolvedModelId, revision)
   ]);
 
   post("load-progress", {
     phase: "config",
-    info: {
-      status: manifest?.shards?.length ? "restoring_cached_model_plan" : "planning_weight_stream",
-      progress: 0.06
-    }
+    info: { status: "inspecting_checkpoint_layout", progress: 0.22 }
   });
+
+  const manifest = await inspectManifest(resolvedModelId, revision);
+  post("load-progress", {
+    phase: "runtime",
+    info: { status: "initializing_webgpu", progress: 0.34 }
+  });
+
+  const kernelHarness = new PapertrailQwenKernelHarness(GpuOps, shaders);
+  await kernelHarness.init();
 
   post("load-progress", {
     phase: "runtime",
-    info: { status: "initializing_webgpu", progress: 0.08 }
+    info: { status: "running_kernel_self_test", progress: 0.52 }
   });
 
-  const gpu = new GpuOps();
-  await gpu.init();
-
-  post("load-progress", {
-    phase: "runtime",
-    info: { status: "compiling_tensorbend_pipelines", progress: 0.1 }
-  });
-
-  const model = new Qwen35Model(gpu, config, quantConfig);
-  assignSamplingDefaults(model);
-  model.compilePipelines();
-
-  let cacheManifest = manifest;
-
-  if (cacheManifest?.shards?.length) {
-    post("load-progress", {
-      phase: "cache",
-      info: { status: "restoring_quantized_cache", progress: 0.14 }
-    });
-    try {
-      await hydrateFromPackedCache(model, resolvedModelId, revision, cacheManifest);
-    } catch (error) {
-      console.warn("Packed cache restore failed, rebuilding from network", error);
-      await packedCache.clearModel(resolvedModelId, revision, cacheManifest);
-      cacheManifest = null;
-    }
-  }
-
-  if (!cacheManifest) {
-    post("load-progress", {
-      phase: "weights",
-      info: { status: "streaming_quantized_weights", progress: 0.12 }
-    });
-    cacheManifest = await streamAndCachePackedWeights(model, resolvedModelId, revision);
-  }
-
-  post("load-progress", {
-    phase: "weights",
-    info: {
-      status: "post_processing_weights",
-      progress: 0.97
-    }
-  });
-
-  await model.postProcessWeights();
-
+  const selfTest = await kernelHarness.runGptqSelfTest();
   post("load-progress", {
     phase: "runtime",
     info: {
-      status: "allocating_runtime_buffers",
-      progress: 0.99
+      status: selfTest.ok ? "kernel_self_test_passed" : "kernel_self_test_failed",
+      progress: 0.7
     }
+  });
+
+  const analysis = analyzeCustomQwenBackend({
+    config,
+    manifest,
+    shaderKeys: kernelHarness.availableKernelKeys()
+  });
+  analysis.selfTest = selfTest;
+
+  post("load-progress", {
+    phase: "runtime",
+    info: { status: "building_custom_decoder_plan", progress: 0.88 }
   });
 
   const contextLength = chooseContextLength(gpuInfo);
-  model.initBuffers(contextLength);
 
   runtime.modelId = resolvedModelId;
   runtime.revision = revision;
-  runtime.tokenizer = tokenizer;
-  runtime.model = model;
-  runtime.gpu = gpu;
+  runtime.tokenizer = tokenizerBundle.tokenizer;
+  runtime.tokenizerConfig = tokenizerBundle.tokenizerConfig ?? {};
+  runtime.gpu = kernelHarness.gpu;
+  runtime.kernelHarness = kernelHarness;
+  runtime.analysis = analysis;
   runtime.config = config;
   runtime.quantConfig = quantConfig ?? {
     bits: 4,
@@ -584,94 +386,99 @@ async function handleLoad({ modelId = MODEL_ID, gpuInfo, revision = DEFAULT_REVI
     quant_method: "auto-round"
   };
   runtime.contextLength = contextLength;
-  runtime.cacheManifest = cacheManifest;
   runtime.interruptRequested = false;
+  runtime.generateStatusDetail = null;
+  runtime.engine = new PapertrailQwenCustomEngine({
+    modelId: resolvedModelId,
+    revision,
+    config,
+    manifest,
+    tokenizer: runtime.tokenizer,
+    tokenizerConfig: runtime.tokenizerConfig,
+    fetchRangeBytes,
+    gpu: kernelHarness.gpu,
+    shaders,
+    quantConfig: runtime.quantConfig,
+    contextLength,
+    statusCallback: ({ phase, detail }) => {
+      runtime.generateStatusDetail = detail ?? phase ?? "preparing_custom_decoder";
+      post("generate-status", {
+        phase: phase ?? "runtime",
+        detail: runtime.generateStatusDetail
+      });
+    }
+  });
 
   post("load-ready", {
     modelId: resolvedModelId,
     dtype: DEFAULT_DTYPE,
-    backend: "papertrail/tensorbend-webgpu",
+    backend: CUSTOM_QWEN_BACKEND,
     contextLength,
-    cacheMode: "packed-opfs"
+    detail: formatCustomBackendDetail(analysis, {
+      selfTestPassed: selfTest.ok,
+      decoderReady: true
+    }),
+    analysis: {
+      fullAttentionLayers: analysis.fullAttentionLayers,
+      linearAttentionLayers: analysis.linearAttentionLayers,
+      tensorCount: analysis.manifest.tensorCount,
+      shardCount: analysis.manifest.shardCount,
+      quantization: analysis.quantization,
+      missingKernels: analysis.missingKernels,
+      missingTensors: analysis.missingTensors.slice(0, 8),
+      selfTest
+    }
   });
 }
 
 async function handleGenerate({ requestId, prompt, maxNewTokens = 160 }) {
-  if (!runtime.model || !runtime.tokenizer) {
-    throw new Error("model-not-ready");
+  if (!runtime.engine) {
+    throw new Error("custom-backend-not-loaded");
   }
 
-  runtime.interruptRequested = false;
   runtime.activeRequestId = requestId;
+  runtime.interruptRequested = false;
+  runtime.generateStatusDetail = "Preparing custom decoder…";
+  post("generate-start", { requestId, modelId: runtime.modelId });
 
-  post("generate-start", {
-    requestId,
-    modelId: runtime.modelId
-  });
-
-  const encodedPrompt = runtime.tokenizer.encode(prompt ?? "");
-  const {
-    tokenIds: promptTokenIds,
-    truncatedPromptTokens
-  } = truncatePromptTokens(encodedPrompt, runtime.contextLength, maxNewTokens);
-
-  const streamedTokenIds = [];
-  let interrupted = false;
-
-  const sequence = await runtime.model.generate(
-    promptTokenIds,
-    maxNewTokens,
-    (tokenId) => {
-      if (runtime.interruptRequested) {
-        interrupted = true;
-        return true;
-      }
-
-      streamedTokenIds.push(tokenId);
-      post("generate-chunk", {
-        requestId,
-        text: runtime.tokenizer.decode(streamedTokenIds)
-      });
-      return false;
-    }
-  );
-
-  const generatedTokenIds =
-    Array.isArray(sequence) && sequence.length >= promptTokenIds.length
-      ? sequence.slice(promptTokenIds.length)
-      : streamedTokenIds;
-
-  const finalText = runtime.tokenizer.decode(generatedTokenIds);
-  const basePayload = {
-    requestId,
-    modelId: runtime.modelId,
-    contextLength: runtime.contextLength,
-    promptTokens: promptTokenIds.length,
-    outputTokens: generatedTokenIds.length,
-    maxNewTokens,
-    truncatedPromptTokens
-  };
-
-  runtime.activeRequestId = null;
-
-  if (interrupted || runtime.interruptRequested) {
-    runtime.interruptRequested = false;
-    post("generate-error", {
-      ...basePayload,
-      message: "generation-interrupted"
+  const heartbeat = setInterval(() => {
+    post("generate-status", {
+      phase: "heartbeat",
+      detail: runtime.generateStatusDetail ?? "Generating…"
     });
-    post("interrupt-complete", {
+  }, 4000);
+
+  try {
+    const generated = await runtime.engine.generate(prompt ?? "", {
+      maxNewTokens,
+      shouldInterrupt: () => runtime.interruptRequested,
+      onPartial: (text) => {
+        post("generate-chunk", {
+          requestId,
+          text,
+          contextLength: runtime.contextLength
+        });
+      }
+    });
+
+    runtime.activeRequestId = null;
+    runtime.interruptRequested = false;
+    runtime.generateStatusDetail = null;
+    post("generate-complete", {
       requestId,
+      text: generated.text ?? "",
+      rawTextPreview: String(generated.rawText ?? "").slice(0, 240),
+      firstTokenIds: Array.isArray(generated.tokenIds) ? generated.tokenIds.slice(0, 16) : [],
+      promptTokens: generated.promptTokenCount ?? 0,
+      outputTokens: generated.tokenIds?.length ?? 0,
+      maxNewTokens,
+      hitTokenLimit: Boolean(generated.hitTokenLimit),
+      stopTokenId: generated.stopTokenId ?? null,
       contextLength: runtime.contextLength
     });
-    return;
+  } finally {
+    clearInterval(heartbeat);
   }
-
-  post("generate-complete", {
-    ...basePayload,
-    text: finalText,
-    hitTokenLimit: generatedTokenIds.length >= maxNewTokens
-  });
 }
 
 function handleInterrupt() {

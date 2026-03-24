@@ -11,7 +11,7 @@ export const QWEN_WEBGPU_MODELS = [
   {
     id: "Intel/Qwen3.5-2B-int4-AutoRound",
     label: "2B AutoRound",
-    description: "Packed INT4 Tensorbend WebGPU runtime"
+    description: "Custom WebGPU kernel scaffold"
   }
 ];
 
@@ -28,6 +28,33 @@ function modelLabelFor(modelId) {
     normalized.split("/").at(-1) ??
     normalized
   );
+}
+
+function cloneableGpuInfo(gpuInfo) {
+  if (!gpuInfo || typeof gpuInfo !== "object") {
+    return gpuInfo ?? null;
+  }
+  const limits =
+    gpuInfo.limits && typeof gpuInfo.limits === "object"
+      ? { ...gpuInfo.limits }
+      : null;
+  const adapterInfo =
+    gpuInfo.adapterInfo && typeof gpuInfo.adapterInfo === "object"
+      ? {
+          vendor: gpuInfo.adapterInfo.vendor ?? null,
+          architecture: gpuInfo.adapterInfo.architecture ?? null,
+          device: gpuInfo.adapterInfo.device ?? null,
+          description: gpuInfo.adapterInfo.description ?? null
+        }
+      : null;
+
+  return {
+    available: Boolean(gpuInfo.available),
+    reason: gpuInfo.reason ?? null,
+    fp16Supported: Boolean(gpuInfo.fp16Supported),
+    limits,
+    adapterInfo
+  };
 }
 
 function normalizeProgress(value) {
@@ -84,9 +111,9 @@ function describeReadyDetail(message, fallbackLabel, fallbackDtype) {
   const contextLength = Number(message.contextLength);
   const cacheMode = message.cacheMode === "packed-opfs" ? "packed local cache" : null;
   if (Number.isFinite(contextLength) && contextLength > 0) {
-    return `${label} loaded on WebGPU via Tensorbend (${dtype}, ${contextLength}-token context${cacheMode ? `, ${cacheMode}` : ""}).`;
+    return `${label} loaded on WebGPU via the custom backend (${dtype}, ${contextLength}-token context${cacheMode ? `, ${cacheMode}` : ""}).`;
   }
-  return `${label} loaded on WebGPU via Tensorbend (${dtype}${cacheMode ? `, ${cacheMode}` : ""}).`;
+  return `${label} loaded on WebGPU via the custom backend (${dtype}${cacheMode ? `, ${cacheMode}` : ""}).`;
 }
 
 export class QwenWebGpuTextRuntime {
@@ -106,7 +133,7 @@ export class QwenWebGpuTextRuntime {
     this.loadPromise = null;
     this.requestCounter = 0;
     this.state = {
-      backend: "papertrail/tensorbend-webgpu",
+      backend: "papertrail/qwen35-custom",
       modelId: this.modelId,
       label: modelLabelFor(this.modelId),
       status: "idle",
@@ -185,6 +212,7 @@ export class QwenWebGpuTextRuntime {
     }
 
     const worker = this.#ensureWorker();
+    const safeGpuInfo = cloneableGpuInfo(gpuInfo);
     this.#updateState({
       modelId: this.modelId,
       label: modelLabelFor(this.modelId),
@@ -193,12 +221,12 @@ export class QwenWebGpuTextRuntime {
       dtype: null,
       progress: 0,
       error: null,
-      detail: `Loading ${modelLabelFor(this.modelId)} with Tensorbend…`
+      detail: `Loading ${modelLabelFor(this.modelId)} with the custom backend…`
     });
 
     this.loadPromise = new Promise((resolve, reject) => {
       const pendingLoad = {
-        gpuInfo,
+        gpuInfo: safeGpuInfo,
         stallTimer: null,
         resolve: (value) => {
           if (pendingLoad.stallTimer) {
@@ -217,13 +245,13 @@ export class QwenWebGpuTextRuntime {
         if (this.pendingLoad !== pendingLoad) {
           return;
         }
-        const error = new Error("tensorbend-bootstrap-stalled");
+        const error = new Error("custom-backend-bootstrap-stalled");
         this.#updateState({
           status: "error",
           ready: false,
           error: error.message,
           detail:
-            "Tensorbend bootstrap stalled before model download began. The current bundled backend is not advancing past startup."
+            "The custom backend stalled before checkpoint analysis completed."
         });
         this.#disposeWorker();
         pendingLoad.reject(error);
@@ -233,7 +261,7 @@ export class QwenWebGpuTextRuntime {
         type: "load",
         data: {
           modelId: this.modelId,
-          gpuInfo
+          gpuInfo: safeGpuInfo
         }
       });
     }).finally(() => {
@@ -243,11 +271,13 @@ export class QwenWebGpuTextRuntime {
     return this.loadPromise;
   }
 
-  async generate({ messages, maxNewTokens = 160, onPartial } = {}) {
+  async generate({ messages, maxNewTokens = 160, onPartial, onStatus } = {}) {
     if (!this.state.ready) {
       throw new Error(
         this.state.status === "loading"
           ? "model-loading"
+          : this.state.status === "parked"
+            ? "custom-backend-parked"
           : this.state.error ?? "model-not-ready"
       );
     }
@@ -273,7 +303,8 @@ export class QwenWebGpuTextRuntime {
         requestId,
         resolve,
         reject,
-        onPartial
+        onPartial,
+        onStatus
       };
       worker.postMessage({
         type: "generate",
@@ -295,8 +326,15 @@ export class QwenWebGpuTextRuntime {
       return this.worker;
     }
 
-    this.worker = new Worker(new URL("./qwen-webgpu-worker.js", import.meta.url), {
-      type: "module"
+    const WorkerCtor = globalThis.Worker;
+    if (typeof WorkerCtor !== "function") {
+      throw new Error("worker-unavailable");
+    }
+
+    const workerUrl = new URL("./qwen-webgpu-worker.js", import.meta.url);
+    this.worker = new WorkerCtor(workerUrl.href, {
+      type: "module",
+      name: "papertrail-qwen-worker"
     });
 
     this.worker.addEventListener("message", (event) => {
@@ -344,7 +382,7 @@ export class QwenWebGpuTextRuntime {
           status: "loading",
           ready: false,
           dtype: message.dtype ?? this.state.dtype,
-          detail: `Loading ${modelLabelFor(message.modelId ?? this.modelId)} with Tensorbend…`
+          detail: `Loading ${modelLabelFor(message.modelId ?? this.modelId)} with the custom backend…`
         });
         break;
       }
@@ -357,13 +395,13 @@ export class QwenWebGpuTextRuntime {
             if (this.pendingLoad !== pendingLoad) {
               return;
             }
-            const error = new Error("tensorbend-load-stalled");
+            const error = new Error("custom-backend-load-stalled");
             this.#updateState({
               status: "error",
               ready: false,
               error: error.message,
               detail:
-                "Tensorbend load stalled during startup. The current backend is not completing reliably on this path."
+                "The custom backend stalled while analyzing the checkpoint or kernels."
             });
             this.#disposeWorker();
             pendingLoad.reject(error);
@@ -378,6 +416,30 @@ export class QwenWebGpuTextRuntime {
             this.state.progress,
           detail: summarizeProgress(message.info, message.phase ?? "model")
         });
+        break;
+      }
+
+      case "load-parked": {
+        this.#updateState({
+          modelId: message.modelId ?? this.modelId,
+          label: modelLabelFor(message.modelId ?? this.modelId),
+          status: "parked",
+          ready: false,
+          dtype: message.dtype ?? this.state.dtype ?? "int4",
+          progress: 100,
+          error: null,
+          detail:
+            message.detail ??
+            "The custom backend finished analysis but the live decoder graph is not ported yet.",
+          backend: message.backend ?? this.state.backend
+        });
+        if (this.pendingLoad) {
+          this.pendingLoad.resolve({
+            ...this.getState(),
+            gpuInfo: this.pendingLoad.gpuInfo
+          });
+          this.pendingLoad = null;
+        }
         break;
       }
 
@@ -441,6 +503,19 @@ export class QwenWebGpuTextRuntime {
         break;
       }
 
+      case "generate-status": {
+        if (this.pendingGeneration) {
+          this.pendingGeneration.onStatus?.(message.detail ?? message.phase ?? "working");
+        }
+        if (this.state.status === "generating") {
+          this.#updateState({
+            status: "generating",
+            detail: message.detail ?? this.state.detail
+          });
+        }
+        break;
+      }
+
       case "generate-complete": {
         if (
           this.pendingGeneration &&
@@ -448,10 +523,13 @@ export class QwenWebGpuTextRuntime {
         ) {
           this.pendingGeneration.resolve({
             text: message.text ?? "",
+            rawTextPreview: message.rawTextPreview ?? "",
+            firstTokenIds: message.firstTokenIds ?? [],
             promptTokens: message.promptTokens ?? null,
             outputTokens: message.outputTokens ?? null,
             maxNewTokens: message.maxNewTokens ?? null,
             hitTokenLimit: Boolean(message.hitTokenLimit),
+            stopTokenId: message.stopTokenId ?? null,
             modelId: this.state.modelId,
             truncatedPromptTokens: message.truncatedPromptTokens ?? 0
           });

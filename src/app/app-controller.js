@@ -111,9 +111,12 @@ function createTypingIndicator() {
   const el = document.createElement("div");
   el.className = "typing-indicator";
   el.innerHTML =
+    '<div class="typing-dots" aria-hidden="true">' +
     '<span class="typing-dot"></span>' +
     '<span class="typing-dot"></span>' +
-    '<span class="typing-dot"></span>';
+    '<span class="typing-dot"></span>' +
+    "</div>" +
+    '<span class="typing-label">Thinking…</span>';
   return el;
 }
 
@@ -354,6 +357,8 @@ export class AppController {
       button.textContent =
         state.status === "loading"
           ? "Loading…"
+          : state.status === "parked"
+            ? "Analyzed"
           : state.ready
             ? "Loaded"
             : "Load Model";
@@ -364,6 +369,8 @@ export class AppController {
         text.textContent = state.detail;
       } else if (state.status === "ready") {
         text.textContent = `${state.label} is live on WebGPU using ${state.dtype}.`;
+      } else if (state.status === "parked") {
+        text.textContent = state.detail;
       } else if (state.status === "error") {
         text.textContent = `Model load failed: ${state.error}`;
       } else if (state.status === "unsupported") {
@@ -392,6 +399,12 @@ export class AppController {
         progressPhase.textContent = state.detail || "Preparing model…";
         progressPercent.textContent = `${Math.round(progressValue)}%`;
         progressFill.style.width = `${progressValue}%`;
+      } else if (state.status === "parked") {
+        progressPanel.hidden = false;
+        progressPanel.dataset.state = "parked";
+        progressPhase.textContent = "Custom backend analyzed";
+        progressPercent.textContent = "parked";
+        progressFill.style.width = "100%";
       } else if (state.ready) {
         progressPanel.hidden = false;
         progressPanel.dataset.state = "ready";
@@ -416,10 +429,17 @@ export class AppController {
     if (this.elements.qwenBadge) {
       this.elements.qwenBadge.textContent = state.ready
         ? "WebGPU Ready"
+        : state.status === "parked"
+          ? "Custom Parked"
         : state.status === "loading"
           ? "Loading"
           : "Search Fallback";
-      this.elements.qwenBadge.className = state.ready ? "pill pill-success" : "pill pill-warning";
+      this.elements.qwenBadge.className =
+        state.ready
+          ? "pill pill-success"
+          : state.status === "parked"
+            ? "pill pill-warning"
+            : "pill pill-warning";
     }
     if (this.elements.qwenCopy) {
       this.elements.qwenCopy.textContent = text?.textContent ?? state.detail;
@@ -657,6 +677,13 @@ export class AppController {
               body.textContent = partialText;
             }
             this.scrollChatToBottom();
+          },
+          onProgress: (detail) => {
+            touch();
+            const label = typing.querySelector(".typing-label");
+            if (label && detail) {
+              label.textContent = detail;
+            }
           }
         }),
         {
