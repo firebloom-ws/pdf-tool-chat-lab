@@ -197,7 +197,38 @@ export class QwenWebGpuTextRuntime {
     });
 
     this.loadPromise = new Promise((resolve, reject) => {
-      this.pendingLoad = { resolve, reject, gpuInfo };
+      const pendingLoad = {
+        gpuInfo,
+        stallTimer: null,
+        resolve: (value) => {
+          if (pendingLoad.stallTimer) {
+            clearTimeout(pendingLoad.stallTimer);
+          }
+          resolve(value);
+        },
+        reject: (error) => {
+          if (pendingLoad.stallTimer) {
+            clearTimeout(pendingLoad.stallTimer);
+          }
+          reject(error);
+        }
+      };
+      pendingLoad.stallTimer = setTimeout(() => {
+        if (this.pendingLoad !== pendingLoad) {
+          return;
+        }
+        const error = new Error("tensorbend-bootstrap-stalled");
+        this.#updateState({
+          status: "error",
+          ready: false,
+          error: error.message,
+          detail:
+            "Tensorbend bootstrap stalled before model download began. The current bundled backend is not advancing past startup."
+        });
+        this.#disposeWorker();
+        pendingLoad.reject(error);
+      }, 45000);
+      this.pendingLoad = pendingLoad;
       worker.postMessage({
         type: "load",
         data: {
@@ -319,6 +350,25 @@ export class QwenWebGpuTextRuntime {
       }
 
       case "load-progress": {
+        if (this.pendingLoad?.stallTimer) {
+          const pendingLoad = this.pendingLoad;
+          clearTimeout(this.pendingLoad.stallTimer);
+          this.pendingLoad.stallTimer = setTimeout(() => {
+            if (this.pendingLoad !== pendingLoad) {
+              return;
+            }
+            const error = new Error("tensorbend-load-stalled");
+            this.#updateState({
+              status: "error",
+              ready: false,
+              error: error.message,
+              detail:
+                "Tensorbend load stalled during startup. The current backend is not completing reliably on this path."
+            });
+            this.#disposeWorker();
+            pendingLoad.reject(error);
+          }, 45000);
+        }
         this.#updateState({
           status: "loading",
           ready: false,

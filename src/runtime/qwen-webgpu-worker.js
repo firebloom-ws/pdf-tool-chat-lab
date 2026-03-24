@@ -477,7 +477,17 @@ async function handleLoad({ modelId = MODEL_ID, gpuInfo, revision = DEFAULT_REVI
     backend: "papertrail/tensorbend-webgpu"
   });
 
+  post("load-progress", {
+    phase: "runtime",
+    info: { status: "bootstrapping_tensorbend_modules", progress: 0.01 }
+  });
+
   const { GpuOps, Qwen35Model } = await loadTensorbendModules();
+
+  post("load-progress", {
+    phase: "runtime",
+    info: { status: "tensorbend_modules_ready", progress: 0.02 }
+  });
 
   post("load-progress", {
     phase: "config",
