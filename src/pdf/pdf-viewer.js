@@ -32,6 +32,8 @@ export class PdfViewer {
     this.currentPage = 1;
     this.zoom = 1;
     this.currentBoxes = [];
+    this.renderAbortController = null;
+    this.renderRequestId = 0;
   }
 
   async attachDocument(bundle, pages = []) {
@@ -89,22 +91,52 @@ export class PdfViewer {
       return;
     }
 
-    const rendering = await renderPdfPage({
-      pdfDocument: this.bundle.pdfDocument,
-      pageNumber: this.currentPage,
-      canvas: this.canvas,
-      zoom: this.zoom,
-      containerWidth: Math.max(280, this.frame.clientWidth - 48)
-    });
+    const requestId = ++this.renderRequestId;
+    this.renderAbortController?.abort();
+    const abortController = new AbortController();
+    this.renderAbortController = abortController;
 
-    renderFocusBoxes(this.overlay, this.currentBoxes);
-    this.pageLabel.textContent = `Page ${this.currentPage} / ${this.bundle.pageCount}`;
-    this.zoomLabel.textContent = `${Math.round(this.zoom * 100)}%`;
+    const targetPage = this.currentPage;
+    const targetZoom = this.zoom;
+    const targetBoxes = [...this.currentBoxes];
+
+    let rendering;
+    try {
+      rendering = await renderPdfPage({
+        pdfDocument: this.bundle.pdfDocument,
+        pageNumber: targetPage,
+        canvas: this.canvas,
+        zoom: targetZoom,
+        containerWidth: Math.max(280, this.frame.clientWidth - 48),
+        signal: abortController.signal
+      });
+    } catch (error) {
+      if (
+        abortController.signal.aborted ||
+        error?.name === "RenderingCancelledException" ||
+        error?.message === "pdf-render-cancelled"
+      ) {
+        return;
+      }
+      throw error;
+    }
+
+    if (requestId !== this.renderRequestId) {
+      return;
+    }
+
+    if (this.renderAbortController === abortController) {
+      this.renderAbortController = null;
+    }
+
+    renderFocusBoxes(this.overlay, targetBoxes);
+    this.pageLabel.textContent = `Page ${targetPage} / ${this.bundle.pageCount}`;
+    this.zoomLabel.textContent = `${Math.round(targetZoom * 100)}%`;
 
     for (const chip of this.pageRail.querySelectorAll(".page-chip")) {
       chip.classList.toggle(
         "is-active",
-        Number(chip.dataset.pageNumber) === this.currentPage
+        Number(chip.dataset.pageNumber) === targetPage
       );
     }
 

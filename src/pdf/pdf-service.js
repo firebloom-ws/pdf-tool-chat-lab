@@ -103,10 +103,23 @@ export async function renderPdfPage({
   pageNumber,
   canvas,
   zoom = 1,
-  containerWidth
+  containerWidth,
+  signal = null
 }) {
   await loadPdfJs();
+  if (signal?.aborted) {
+    const error = new Error("pdf-render-cancelled");
+    error.name = "RenderingCancelledException";
+    throw error;
+  }
+
   const page = await pdfDocument.getPage(pageNumber);
+  if (signal?.aborted) {
+    const error = new Error("pdf-render-cancelled");
+    error.name = "RenderingCancelledException";
+    throw error;
+  }
+
   const baseViewport = page.getViewport({ scale: 1 });
   const fitScale = containerWidth ? containerWidth / baseViewport.width : 1.2;
   const viewport = page.getViewport({ scale: fitScale * zoom });
@@ -121,11 +134,35 @@ export async function renderPdfPage({
   const transform =
     outputScale === 1 ? null : [outputScale, 0, 0, outputScale, 0, 0];
 
-  await page.render({
+  const renderTask = page.render({
     canvasContext: context,
     viewport,
     transform
-  }).promise;
+  });
+
+  const handleAbort = () => {
+    try {
+      renderTask.cancel();
+    } catch {
+      // Ignore late cancellation errors.
+    }
+  };
+
+  signal?.addEventListener("abort", handleAbort, { once: true });
+
+  try {
+    await renderTask.promise;
+  } catch (error) {
+    if (
+      error?.name === "RenderingCancelledException" ||
+      error?.message === "pdf-render-cancelled"
+    ) {
+      throw error;
+    }
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", handleAbort);
+  }
 
   return {
     width: viewport.width,

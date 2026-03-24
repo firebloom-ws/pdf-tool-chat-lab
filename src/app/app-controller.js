@@ -193,6 +193,10 @@ export class AppController {
       modelSelect: documentRef.getElementById("model-select"),
       loadModelButton: documentRef.getElementById("load-model-button"),
       modelStatusText: documentRef.getElementById("model-status-text"),
+      modelProgressPanel: documentRef.getElementById("model-progress-panel"),
+      modelProgressPhase: documentRef.getElementById("model-progress-phase"),
+      modelProgressPercent: documentRef.getElementById("model-progress-percent"),
+      modelProgressFill: documentRef.getElementById("model-progress-fill"),
       prevPageButton: documentRef.getElementById("prev-page-button"),
       nextPageButton: documentRef.getElementById("next-page-button"),
       zoomOutButton: documentRef.getElementById("zoom-out-button"),
@@ -336,6 +340,10 @@ export class AppController {
     const select = this.elements.modelSelect;
     const button = this.elements.loadModelButton;
     const text = this.elements.modelStatusText;
+    const progressPanel = this.elements.modelProgressPanel;
+    const progressPhase = this.elements.modelProgressPhase;
+    const progressPercent = this.elements.modelProgressPercent;
+    const progressFill = this.elements.modelProgressFill;
 
     if (select && select.value !== state.modelId) {
       select.value = state.modelId;
@@ -367,6 +375,42 @@ export class AppController {
 
     if (state.status === "loading") {
       this.setBackgroundProgress(state.detail);
+    }
+
+    if (progressPanel && progressPhase && progressPercent && progressFill) {
+      const progressValue = Math.max(
+        0,
+        Math.min(
+          100,
+          Number.isFinite(Number(state.progress)) ? Number(state.progress) : 0
+        )
+      );
+
+      if (state.status === "loading") {
+        progressPanel.hidden = false;
+        progressPanel.dataset.state = "loading";
+        progressPhase.textContent = state.detail || "Preparing model…";
+        progressPercent.textContent = `${Math.round(progressValue)}%`;
+        progressFill.style.width = `${progressValue}%`;
+      } else if (state.ready) {
+        progressPanel.hidden = false;
+        progressPanel.dataset.state = "ready";
+        progressPhase.textContent = "Model ready";
+        progressPercent.textContent = "100%";
+        progressFill.style.width = "100%";
+      } else if (state.status === "error") {
+        progressPanel.hidden = false;
+        progressPanel.dataset.state = "error";
+        progressPhase.textContent = state.error || "Model load failed";
+        progressPercent.textContent = "!";
+        progressFill.style.width = "100%";
+      } else {
+        progressPanel.hidden = true;
+        progressPanel.dataset.state = "idle";
+        progressPhase.textContent = "";
+        progressPercent.textContent = "0%";
+        progressFill.style.width = "0%";
+      }
     }
 
     if (this.elements.qwenBadge) {

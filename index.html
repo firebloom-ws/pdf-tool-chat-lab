@@ -145,6 +145,15 @@
             <p id="model-status-text" class="model-status-text">
               4B AutoRound is not loaded yet. Search fallback remains available.
             </p>
+            <div id="model-progress-panel" class="model-progress-panel" hidden>
+              <div class="model-progress-head">
+                <span id="model-progress-phase" class="model-progress-phase">Preparing model…</span>
+                <span id="model-progress-percent" class="model-progress-percent">0%</span>
+              </div>
+              <div class="model-progress-bar" aria-hidden="true">
+                <div id="model-progress-fill" class="model-progress-fill"></div>
+              </div>
+            </div>
             <div id="chat-log" class="chat-log"></div>
             <form id="chat-form" class="chat-form">
               <textarea

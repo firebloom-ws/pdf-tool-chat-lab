@@ -730,6 +730,66 @@ body::before {
   color: var(--muted);
 }
 
+.model-progress-panel {
+  padding: .7rem 1rem .8rem;
+  border-bottom: 1px solid rgba(80,60,40,.08);
+  background:
+    linear-gradient(180deg, rgba(255,252,248,.92), rgba(244,239,232,.9));
+}
+
+.model-progress-panel[hidden] {
+  display: none;
+}
+
+.model-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .8rem;
+  margin-bottom: .45rem;
+  font-family: var(--mono);
+  font-size: .67rem;
+  color: var(--muted);
+}
+
+.model-progress-phase {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-progress-percent {
+  flex-shrink: 0;
+}
+
+.model-progress-bar {
+  position: relative;
+  height: 8px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(89,73,56,.1);
+}
+
+.model-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: inherit;
+  background:
+    linear-gradient(90deg, rgba(13,100,112,.92), rgba(44,152,137,.92));
+  box-shadow: 0 0 18px rgba(13,100,112,.18);
+  transition: width .18s ease-out, background .18s ease-out;
+}
+
+.model-progress-panel[data-state="ready"] .model-progress-fill {
+  background:
+    linear-gradient(90deg, rgba(45,125,70,.92), rgba(84,166,92,.92));
+}
+
+.model-progress-panel[data-state="error"] .model-progress-fill {
+  background:
+    linear-gradient(90deg, rgba(161,73,45,.94), rgba(199,107,71,.94));
+}
+
 /* Chat log */
 .chat-log {
   flex: 1;
