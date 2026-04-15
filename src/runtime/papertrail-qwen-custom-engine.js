@@ -80,6 +80,112 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }
 `;
 
+const PAPERTRAIL_VECTOR_ADD_WGSL = /* wgsl */ `
+struct Params {
+  length: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> left: array<f32>;
+@group(0) @binding(1) var<storage, read> right: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let index = gid.x;
+  if (index >= params.length) {
+    return;
+  }
+  output[index] = left[index] + right[index];
+}
+`;
+
+const PAPERTRAIL_SWIGLU_WGSL = /* wgsl */ `
+struct Params {
+  length: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> gate: array<f32>;
+@group(0) @binding(1) var<storage, read> up: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+fn silu(x: f32) -> f32 {
+  return x / (1.0 + exp(-x));
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let index = gid.x;
+  if (index >= params.length) {
+    return;
+  }
+  output[index] = silu(gate[index]) * up[index];
+}
+`;
+
+const PAPERTRAIL_RMSNORM_WGSL = /* wgsl */ `
+struct Params {
+  length: u32,
+  epsilon: f32,
+  _pad0: u32,
+  _pad1: u32,
+}
+
+@group(0) @binding(0) var<storage, read> input: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+var<workgroup> partialSums: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3u) {
+  let tid = lid.x;
+  var sum = 0.0;
+  var index = tid;
+  loop {
+    if (index >= params.length) {
+      break;
+    }
+    let value = input[index];
+    sum += value * value;
+    index += 256u;
+  }
+
+  partialSums[tid] = sum;
+  workgroupBarrier();
+
+  var stride = 128u;
+  loop {
+    if (stride == 0u) {
+      break;
+    }
+    if (tid < stride) {
+      partialSums[tid] += partialSums[tid + stride];
+    }
+    workgroupBarrier();
+    stride = stride / 2u;
+  }
+
+  let inv = inverseSqrt(partialSums[0] / f32(params.length) + params.epsilon);
+  index = tid;
+  loop {
+    if (index >= params.length) {
+      break;
+    }
+    output[index] = input[index] * inv * weight[index];
+    index += 256u;
+  }
+}
+`;
+
 function modelSlug(modelId) {
   return String(modelId).replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "").toLowerCase();
 }
@@ -91,6 +197,44 @@ function toArrayBuffer(bytes) {
 
 function alignTo4(value) {
   return Math.max(4, Math.ceil(value / 4) * 4);
+}
+
+function createUintParams(values) {
+  const params = new Uint32Array(4);
+  params.set(values.slice(0, 4));
+  return params;
+}
+
+function createRmsNormParams(length, epsilon) {
+  const buffer = new ArrayBuffer(16);
+  const view = new DataView(buffer);
+  view.setUint32(0, length, true);
+  view.setFloat32(4, epsilon, true);
+  view.setUint32(8, 0, true);
+  view.setUint32(12, 0, true);
+  return new Uint8Array(buffer);
+}
+
+async function readBufferBytes(device, buffer, byteLength) {
+  const staging = device.createBuffer({
+    size: alignTo4(byteLength),
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+  });
+  const encoder = device.createCommandEncoder();
+  encoder.copyBufferToBuffer(buffer, 0, staging, 0, byteLength);
+  device.queue.submit([encoder.finish()]);
+  await staging.mapAsync(GPUMapMode.READ);
+  const bytes = new Uint8Array(staging.getMappedRange()).slice(0, byteLength);
+  staging.unmap();
+  staging.destroy();
+  return bytes;
+}
+
+async function readFloat32Buffer(device, buffer, length) {
+  const bytes = await readBufferBytes(device, buffer, length * 4);
+  return new Float32Array(
+    bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + length * 4)
+  );
 }
 
 function sigmoid(value) {
@@ -429,16 +573,19 @@ class LinearAttentionCache {
 }
 
 class RemoteTensorStore {
-  constructor({ modelId, revision, manifest, fetchRangeBytes }) {
+  constructor({ modelId, revision, manifest, fetchRangeBytes, statusCallback = null }) {
     this.modelId = modelId;
     this.revision = revision;
     this.fetchRangeBytes = fetchRangeBytes;
+    this.statusCallback = statusCallback ?? (() => {});
     this.descriptors = new Map((manifest?.tensors ?? []).map((tensor) => [tensor.name, tensor]));
     this.bytesCache = new Map();
     this.vectorCache = new Map();
     this.rowCache = new Map();
-    this.cache = new OpfsCache("papertrail-qwen-custom");
+    this.cache = new OpfsCache("papertrail-qwen-custom-v2");
     this.slug = modelSlug(modelId);
+    this.reportedFetches = new Set();
+    this.transferProgress = new Map();
   }
 
   listNames() {
@@ -473,6 +620,36 @@ class RemoteTensorStore {
     return `rows:${this.slug}:${this.revision}:${name}:${startRow}:${rowCount}`;
   }
 
+  #reportTransferProgress(action, name, loaded, total) {
+    if (!Number.isFinite(total) || total <= 0) {
+      return;
+    }
+    const key = `${action}:${name}`;
+    const percent = Math.max(0, Math.min(100, Math.floor((loaded / total) * 100)));
+    const lastPercent = this.transferProgress.get(key) ?? -1;
+    const shouldEmit = percent >= 100 || lastPercent === -1 || percent - lastPercent >= 2;
+    if (!shouldEmit) {
+      return;
+    }
+    this.transferProgress.set(key, percent);
+    this.statusCallback({
+      phase: action,
+      detail: `${action === "warming-weights" ? "Caching" : "Loading"} ${name} (${percent}%)`
+    });
+  }
+
+  #clearTransferProgress(action, name) {
+    this.transferProgress.delete(`${action}:${name}`);
+  }
+
+  async #readCachedTensorRange(name, start, end) {
+    const cacheKey = this.#tensorCacheKey(name);
+    if (this.bytesCache.has(name)) {
+      return this.bytesCache.get(name).slice(start, end);
+    }
+    return this.cache.readBytesRange(cacheKey, start, end);
+  }
+
   async getTensorBytes(name) {
     if (this.bytesCache.has(name)) {
       return this.bytesCache.get(name);
@@ -486,16 +663,59 @@ class RemoteTensorStore {
     }
 
     const descriptor = this.getDescriptor(name);
+    if (!this.reportedFetches.has(name)) {
+      this.reportedFetches.add(name);
+      this.statusCallback({
+        phase: "loading-weights",
+        detail: `Loading tensor ${name}…`
+      });
+    }
     const bytes = await this.fetchRangeBytes(
       this.modelId,
       descriptor.filePath,
       this.revision,
       descriptor.byteStart,
-      descriptor.byteEnd
+      descriptor.byteEnd,
+      {
+        onProgress: ({ loaded, total }) =>
+          this.#reportTransferProgress("loading-weights", name, loaded, total)
+      }
     );
+    this.#clearTransferProgress("loading-weights", name);
     await this.cache.writeBytes(cacheKey, bytes);
     this.bytesCache.set(name, bytes);
     return bytes;
+  }
+
+  async ensureTensorCached(name) {
+    if (this.bytesCache.has(name)) {
+      return;
+    }
+
+    const cacheKey = this.#tensorCacheKey(name);
+    const cached = await this.cache.readBytes(cacheKey);
+    if (cached) {
+      return;
+    }
+
+    const descriptor = this.getDescriptor(name);
+    this.statusCallback({
+      phase: "warming-weights",
+      detail: `Caching tensor ${name}…`
+    });
+    const bytes = await this.fetchRangeBytes(
+      this.modelId,
+      descriptor.filePath,
+      this.revision,
+      descriptor.byteStart,
+      descriptor.byteEnd,
+      {
+        onProgress: ({ loaded, total }) =>
+          this.#reportTransferProgress("warming-weights", name, loaded, total)
+      }
+    );
+    this.#clearTransferProgress("warming-weights", name);
+    await this.cache.writeBytes(cacheKey, bytes);
   }
 
   async getVector(name, { shiftNorm = false } = {}) {
@@ -526,7 +746,7 @@ class RemoteTensorStore {
     };
   }
 
-  async getRow(name, rowIndex) {
+  async getRow(name, rowIndex, { status = true } = {}) {
     const rowKey = `${name}:${rowIndex}`;
     if (this.rowCache.has(rowKey)) {
       return this.rowCache.get(rowKey);
@@ -549,19 +769,70 @@ class RemoteTensorStore {
     }
     const rowWidth = descriptor.shape[1];
     const rowByteLength = rowWidth * (DTYPE_BYTE_SIZE[descriptor.dtype] ?? 0);
-    const start = descriptor.byteStart + rowIndex * rowByteLength;
-    const end = start + rowByteLength;
+    const localStart = rowIndex * rowByteLength;
+    const localEnd = localStart + rowByteLength;
+    const cachedTensorSlice = await this.#readCachedTensorRange(name, localStart, localEnd);
+    if (cachedTensorSlice?.byteLength === rowByteLength) {
+      const row = decodeTensorBytesToFloat32(descriptor.dtype, toArrayBuffer(cachedTensorSlice));
+      this.rowCache.set(rowKey, row);
+      return row;
+    }
+
+    const start = descriptor.byteStart + localStart;
+    const end = descriptor.byteStart + localEnd;
+    if (status) {
+      this.statusCallback({
+        phase: "loading-weights",
+        detail: `Loading ${name} row ${rowIndex + 1}…`
+      });
+    }
     const bytes = await this.fetchRangeBytes(
       this.modelId,
       descriptor.filePath,
       this.revision,
       start,
-      end
+      end,
+      {
+        onProgress: ({ loaded, total }) =>
+          this.#reportTransferProgress("loading-weights", `${name} row ${rowIndex + 1}`, loaded, total)
+      }
     );
+    this.#clearTransferProgress("loading-weights", `${name} row ${rowIndex + 1}`);
     await this.cache.writeBytes(cacheKey, bytes);
     const row = decodeTensorBytesToFloat32(descriptor.dtype, toArrayBuffer(bytes));
     this.rowCache.set(rowKey, row);
     return row;
+  }
+
+  async prefetchRows(name, rowIndices, { concurrency = 12, onProgress = null } = {}) {
+    const uniqueRows = [...new Set(rowIndices.filter((value) => Number.isInteger(value)))];
+    if (!uniqueRows.length) {
+      return;
+    }
+
+    let completed = 0;
+    const report = () => {
+      onProgress?.({
+        completed,
+        total: uniqueRows.length,
+        progress: uniqueRows.length ? completed / uniqueRows.length : 1,
+        detail: `Caching prompt embeddings ${completed}/${uniqueRows.length}…`
+      });
+    };
+    report();
+
+    let cursor = 0;
+    const workers = new Array(Math.min(concurrency, uniqueRows.length)).fill(null).map(async () => {
+      while (cursor < uniqueRows.length) {
+        const rowIndex = uniqueRows[cursor];
+        cursor += 1;
+        await this.getRow(name, rowIndex, { status: false });
+        completed += 1;
+        report();
+      }
+    });
+
+    await Promise.all(workers);
   }
 
   async getRowsBytes(name, startRow, rowCount) {
@@ -574,14 +845,38 @@ class RemoteTensorStore {
     const descriptor = this.getDescriptor(name);
     const rowWidth = descriptor.shape[1];
     const rowByteLength = rowWidth * (DTYPE_BYTE_SIZE[descriptor.dtype] ?? 0);
-    const start = descriptor.byteStart + startRow * rowByteLength;
-    const end = start + rowCount * rowByteLength;
+    const localStart = startRow * rowByteLength;
+    const localEnd = localStart + rowCount * rowByteLength;
+    const cachedTensorSlice = await this.#readCachedTensorRange(name, localStart, localEnd);
+    if (cachedTensorSlice?.byteLength === rowCount * rowByteLength) {
+      return cachedTensorSlice;
+    }
+
+    const start = descriptor.byteStart + localStart;
+    const end = descriptor.byteStart + localEnd;
+    this.statusCallback({
+      phase: "loading-weights",
+      detail: `Loading ${name} rows ${startRow + 1}-${startRow + rowCount}…`
+    });
     const bytes = await this.fetchRangeBytes(
       this.modelId,
       descriptor.filePath,
       this.revision,
       start,
-      end
+      end,
+      {
+        onProgress: ({ loaded, total }) =>
+          this.#reportTransferProgress(
+            "loading-weights",
+            `${name} rows ${startRow + 1}-${startRow + rowCount}`,
+            loaded,
+            total
+          )
+      }
+    );
+    this.#clearTransferProgress(
+      "loading-weights",
+      `${name} rows ${startRow + 1}-${startRow + rowCount}`
     );
     await this.cache.writeBytes(cacheKey, bytes);
     return bytes;
@@ -600,7 +895,7 @@ class GpuProjectionRunner {
     this.hasF16 = Boolean(gpu?.hasF16);
     this.projectionCache = new Map();
     this.quantizedChunkCache = new Map();
-    this.quantCache = new OpfsCache("papertrail-qwen-int4");
+    this.quantCache = new OpfsCache("papertrail-qwen-int4-v2");
     this.slug = modelSlug(modelId);
   }
 
@@ -617,18 +912,11 @@ class GpuProjectionRunner {
   }
 
   async #readBufferBytes(buffer, byteLength) {
-    const staging = this.gpu.device.createBuffer({
-      size: alignTo4(byteLength),
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-    });
-    const encoder = this.gpu.device.createCommandEncoder();
-    encoder.copyBufferToBuffer(buffer, 0, staging, 0, byteLength);
-    this.gpu.device.queue.submit([encoder.finish()]);
-    await staging.mapAsync(GPUMapMode.READ);
-    const bytes = new Uint8Array(staging.getMappedRange()).slice(0, byteLength);
-    staging.unmap();
-    staging.destroy();
-    return bytes;
+    return readBufferBytes(this.gpu.device, buffer, byteLength);
+  }
+
+  async readFloatBuffer(buffer, length) {
+    return readFloat32Buffer(this.gpu.device, buffer, length);
   }
 
   async #denseMatrix(name) {
@@ -722,11 +1010,29 @@ class GpuProjectionRunner {
   }
 
   async #runDense(weightBuffer, input, inputSize, outputSize) {
+    const inputBuffer = this.gpu.createBufferFromData("pt-input", input);
+    try {
+      const outputBuffer = this.#runDenseToBuffer(
+        weightBuffer,
+        inputBuffer,
+        inputSize,
+        outputSize
+      );
+      try {
+        return await this.readFloatBuffer(outputBuffer, outputSize);
+      } finally {
+        outputBuffer.destroy();
+      }
+    } finally {
+      inputBuffer.destroy();
+    }
+  }
+
+  #runDenseToBuffer(weightBuffer, inputBuffer, inputSize, outputSize) {
     const shader = this.shaders?.bf16_matvec;
     if (!shader) {
       throw new Error("Missing bf16_matvec shader.");
     }
-    const inputBuffer = this.gpu.createBufferFromData("pt-input", input);
     const outputBuffer = this.gpu.createBuffer(
       "pt-output",
       outputSize * 4,
@@ -734,27 +1040,43 @@ class GpuProjectionRunner {
     );
     const params = this.gpu.createBufferFromData(
       "pt-dense-params",
-      new Uint32Array([inputSize, outputSize]),
+      createUintParams([inputSize, outputSize, 0, 0]),
       GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     );
-    try {
-      const pipeline = this.gpu.getOrCreatePipeline("pt-bf16-matvec", shader);
-      const bindGroup = this.gpu.createBindGroup(pipeline, 0, [
-        inputBuffer,
-        weightBuffer,
-        outputBuffer,
-        params
-      ]);
-      this.gpu.dispatch(pipeline, [bindGroup], Math.ceil(outputSize / 256));
-      return await this.gpu.readBuffer(outputBuffer, outputSize * 4);
-    } finally {
-      inputBuffer.destroy();
-      outputBuffer.destroy();
-      params.destroy();
-    }
+    const pipeline = this.gpu.getOrCreatePipeline("pt-bf16-matvec", shader);
+    const bindGroup = this.gpu.createBindGroup(pipeline, 0, [
+      inputBuffer,
+      weightBuffer,
+      outputBuffer,
+      params
+    ]);
+    this.gpu.dispatch(pipeline, [bindGroup], Math.ceil(outputSize / 256));
+    params.destroy();
+    return outputBuffer;
   }
 
   async #runGptq(qweightBuffer, scalesBuffer, input, inputSize, outputSize, groupSize) {
+    const inputBuffer = this.gpu.createBufferFromData("pt-input", input);
+    try {
+      const outputBuffer = this.#runGptqToBuffer(
+        qweightBuffer,
+        scalesBuffer,
+        inputBuffer,
+        inputSize,
+        outputSize,
+        groupSize
+      );
+      try {
+        return await this.readFloatBuffer(outputBuffer, outputSize);
+      } finally {
+        outputBuffer.destroy();
+      }
+    } finally {
+      inputBuffer.destroy();
+    }
+  }
+
+  #runGptqToBuffer(qweightBuffer, scalesBuffer, inputBuffer, inputSize, outputSize, groupSize) {
     const numGroups = inputSize / groupSize;
     const use4t = numGroups % 4 === 0;
     const shaderKey = use4t
@@ -769,7 +1091,6 @@ class GpuProjectionRunner {
       throw new Error(`Missing ${shaderKey} shader.`);
     }
 
-    const inputBuffer = this.gpu.createBufferFromData("pt-input", input);
     const outputBuffer = this.gpu.createBuffer(
       "pt-output",
       outputSize * 4,
@@ -777,29 +1098,24 @@ class GpuProjectionRunner {
     );
     const params = this.gpu.createBufferFromData(
       "pt-gptq-params",
-      new Uint32Array([inputSize, outputSize, groupSize]),
+      createUintParams([inputSize, outputSize, groupSize, 0]),
       GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     );
-    try {
-      const pipeline = this.gpu.getOrCreatePipeline(`pt-${shaderKey}`, shader);
-      const bindGroup = this.gpu.createBindGroup(pipeline, 0, [
-        inputBuffer,
-        qweightBuffer,
-        scalesBuffer,
-        outputBuffer,
-        params
-      ]);
-      this.gpu.dispatch(
-        pipeline,
-        [bindGroup],
-        use4t ? Math.ceil(outputSize / 8) : Math.ceil(outputSize / 32)
-      );
-      return await this.gpu.readBuffer(outputBuffer, outputSize * 4);
-    } finally {
-      inputBuffer.destroy();
-      outputBuffer.destroy();
-      params.destroy();
-    }
+    const pipeline = this.gpu.getOrCreatePipeline(`pt-${shaderKey}`, shader);
+    const bindGroup = this.gpu.createBindGroup(pipeline, 0, [
+      inputBuffer,
+      qweightBuffer,
+      scalesBuffer,
+      outputBuffer,
+      params
+    ]);
+    this.gpu.dispatch(
+      pipeline,
+      [bindGroup],
+      use4t ? Math.ceil(outputSize / 8) : Math.ceil(outputSize / 32)
+    );
+    params.destroy();
+    return outputBuffer;
   }
 
   async #runGptqWithQzeros(
@@ -817,6 +1133,39 @@ class GpuProjectionRunner {
       throw new Error("GPTQ zero-point buffer is unavailable.");
     }
     const inputBuffer = this.gpu.createBufferFromData("pt-input", input);
+    try {
+      const outputBuffer = this.#runGptqWithQzerosToBuffer(
+        qweightBuffer,
+        qzerosBuffer,
+        scalesBuffer,
+        inputBuffer,
+        inputSize,
+        outputSize,
+        groupSize,
+        packedOutputSize,
+        symmetric
+      );
+      try {
+        return await this.readFloatBuffer(outputBuffer, outputSize);
+      } finally {
+        outputBuffer.destroy();
+      }
+    } finally {
+      inputBuffer.destroy();
+    }
+  }
+
+  #runGptqWithQzerosToBuffer(
+    qweightBuffer,
+    qzerosBuffer,
+    scalesBuffer,
+    inputBuffer,
+    inputSize,
+    outputSize,
+    groupSize,
+    packedOutputSize,
+    symmetric
+  ) {
     const outputBuffer = this.gpu.createBuffer(
       "pt-output",
       outputSize * 4,
@@ -836,26 +1185,21 @@ class GpuProjectionRunner {
       ]),
       GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     );
-    try {
-      const pipeline = this.gpu.getOrCreatePipeline(
-        "pt-gptq-qzeros-matvec",
-        PAPERTRAIL_GPTQ_QZEROS_MATVEC_WGSL
-      );
-      const bindGroup = this.gpu.createBindGroup(pipeline, 0, [
-        inputBuffer,
-        qweightBuffer,
-        qzerosBuffer,
-        scalesBuffer,
-        outputBuffer,
-        params
-      ]);
-      this.gpu.dispatch(pipeline, [bindGroup], Math.ceil(outputSize / 64));
-      return await this.gpu.readBuffer(outputBuffer, outputSize * 4);
-    } finally {
-      inputBuffer.destroy();
-      outputBuffer.destroy();
-      params.destroy();
-    }
+    const pipeline = this.gpu.getOrCreatePipeline(
+      "pt-gptq-qzeros-matvec",
+      PAPERTRAIL_GPTQ_QZEROS_MATVEC_WGSL
+    );
+    const bindGroup = this.gpu.createBindGroup(pipeline, 0, [
+      inputBuffer,
+      qweightBuffer,
+      qzerosBuffer,
+      scalesBuffer,
+      outputBuffer,
+      params
+    ]);
+    this.gpu.dispatch(pipeline, [bindGroup], Math.ceil(outputSize / 64));
+    params.destroy();
+    return outputBuffer;
   }
 
   async project(baseName, input) {
@@ -865,24 +1209,49 @@ class GpuProjectionRunner {
         `Projection ${baseName} expected ${projection.inputSize} inputs, got ${input.length}`
       );
     }
+    const inputBuffer = this.gpu.createBufferFromData("pt-input", input);
+    try {
+      const outputBuffer = await this.projectToBuffer(baseName, inputBuffer, projection.inputSize);
+      try {
+        return await this.readFloatBuffer(outputBuffer, projection.outputSize);
+      } finally {
+        outputBuffer.destroy();
+      }
+    } finally {
+      inputBuffer.destroy();
+    }
+  }
+
+  async projectToBuffer(baseName, inputBuffer, inputSize) {
+    const projection = await this.#projection(baseName);
+    if (inputSize !== projection.inputSize) {
+      throw new Error(
+        `Projection ${baseName} expected ${projection.inputSize} inputs, got ${inputSize}`
+      );
+    }
     return projection.kind === "dense"
-      ? this.#runDense(projection.weightBuffer, input, projection.inputSize, projection.outputSize)
+      ? this.#runDenseToBuffer(
+          projection.weightBuffer,
+          inputBuffer,
+          projection.inputSize,
+          projection.outputSize
+        )
       : projection.qzerosBuffer
-        ? this.#runGptqWithQzeros(
+        ? this.#runGptqWithQzerosToBuffer(
             projection.qweightBuffer,
             projection.qzerosBuffer,
             projection.scalesBuffer,
-            input,
+            inputBuffer,
             projection.inputSize,
             projection.outputSize,
             projection.groupSize,
             projection.packedOutputSize,
             projection.symmetric
           )
-        : this.#runGptq(
+        : this.#runGptqToBuffer(
             projection.qweightBuffer,
             projection.scalesBuffer,
-            input,
+            inputBuffer,
             projection.inputSize,
             projection.outputSize,
             projection.groupSize
@@ -1074,63 +1443,124 @@ class GpuProjectionRunner {
     return entry;
   }
 
-  async nextTokenFromLmHead(input, denseName) {
+  async prequantizeLmHead(denseName, { onProgress = null } = {}) {
     const descriptor = this.tensorStore.getDescriptor(denseName);
     const vocabSize = descriptor.shape[0];
     const inputSize = descriptor.shape[1];
+    const totalChunks = Math.ceil(vocabSize / LM_HEAD_CHUNK_ROWS);
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+      const startRow = chunkIndex * LM_HEAD_CHUNK_ROWS;
+      const rowCount = Math.min(LM_HEAD_CHUNK_ROWS, vocabSize - startRow);
+      onProgress?.({
+        chunkIndex: chunkIndex + 1,
+        totalChunks,
+        progress: (chunkIndex + 1) / totalChunks,
+        detail: `Prepacking lm_head chunk ${chunkIndex + 1}/${totalChunks}…`
+      });
+      await this.#quantizeChunk(denseName, startRow, rowCount, inputSize);
+    }
+  }
+
+  async prefetchProjection(baseName, { uploadToGpu = false } = {}) {
+    if (uploadToGpu || this.projectionCache.has(baseName)) {
+      await this.#projection(baseName);
+      return;
+    }
+
+    const tensorNames = new Set(this.tensorStore.listNames());
+    const kind = projectionKind(baseName, tensorNames);
+    if (kind === "missing") {
+      throw new Error(`Missing projection weights for ${baseName}`);
+    }
+    if (kind === "dense") {
+      await this.tensorStore.ensureTensorCached(`${baseName}.weight`);
+      return;
+    }
+    await Promise.all([
+      this.tensorStore.ensureTensorCached(`${baseName}.qweight`),
+      this.tensorStore.ensureTensorCached(`${baseName}.scales`),
+      this.tensorStore.has(`${baseName}.qzeros`)
+        ? this.tensorStore.ensureTensorCached(`${baseName}.qzeros`)
+        : Promise.resolve()
+    ]);
+  }
+
+  async nextTokenFromLmHead(input, denseName) {
+    const descriptor = this.tensorStore.getDescriptor(denseName);
+    const inputSize = descriptor.shape[1];
     if (input.length !== inputSize) {
       throw new Error(`lm_head expected ${inputSize} inputs, got ${input.length}`);
+    }
+    const inputBuffer = this.gpu.createBufferFromData("pt-lmhead-input", input);
+    try {
+      return await this.nextTokenFromLmHeadBuffer(inputBuffer, inputSize, denseName);
+    } finally {
+      inputBuffer.destroy();
+    }
+  }
+
+  async nextTokenFromLmHeadBuffer(inputBuffer, inputSize, denseName) {
+    const descriptor = this.tensorStore.getDescriptor(denseName);
+    const vocabSize = descriptor.shape[0];
+    if (inputSize !== descriptor.shape[1]) {
+      throw new Error(`lm_head expected ${descriptor.shape[1]} inputs, got ${inputSize}`);
     }
 
     let bestToken = 0;
     let bestValue = Number.NEGATIVE_INFINITY;
     const totalChunks = Math.ceil(vocabSize / LM_HEAD_CHUNK_ROWS);
-    const inputBuffer = this.gpu.createBufferFromData("pt-lmhead-input", input);
 
-    try {
-      for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
-        const startRow = chunkIndex * LM_HEAD_CHUNK_ROWS;
-        const rowCount = Math.min(LM_HEAD_CHUNK_ROWS, vocabSize - startRow);
-        const chunkBytes = await this.tensorStore.getRowsBytes(denseName, startRow, rowCount);
-        const weightBuffer = this.gpu.createBufferFromData(
-          `pt-lmhead-bf16:${chunkIndex}`,
-          chunkBytes
+    const numGroups = inputSize / LM_HEAD_GROUP_SIZE;
+    const use4t = numGroups % 4 === 0;
+    const shaderKey = use4t
+      ? this.hasF16
+        ? "gptq_matvec_4t_f16"
+        : "gptq_matvec_4t"
+      : this.hasF16
+        ? "gptq_matvec_f16"
+        : "gptq_matvec";
+    const shader = this.shaders?.[shaderKey];
+    if (!shader) {
+      throw new Error(`Missing ${shaderKey} shader.`);
+    }
+    const pipeline = this.gpu.getOrCreatePipeline(`pt-lmhead-${shaderKey}`, shader);
+
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+      const startRow = chunkIndex * LM_HEAD_CHUNK_ROWS;
+      const rowCount = Math.min(LM_HEAD_CHUNK_ROWS, vocabSize - startRow);
+      const quantizedChunk = await this.#quantizeChunk(denseName, startRow, rowCount, inputSize);
+      const logitsBuffer = this.gpu.createBuffer(
+        `pt-lmhead-logits:${chunkIndex}`,
+        rowCount * 4,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+      );
+      const params = this.gpu.createBufferFromData(
+        `pt-lmhead-params:${chunkIndex}`,
+        createUintParams([inputSize, rowCount, LM_HEAD_GROUP_SIZE, 0]),
+        GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+      );
+      try {
+        const bindGroup = this.gpu.createBindGroup(pipeline, 0, [
+          inputBuffer,
+          quantizedChunk.qweightBuffer,
+          quantizedChunk.scalesBuffer,
+          logitsBuffer,
+          params
+        ]);
+        this.gpu.dispatch(
+          pipeline,
+          [bindGroup],
+          use4t ? Math.ceil(rowCount / 8) : Math.ceil(rowCount / 32)
         );
-        const logitsBuffer = this.gpu.createBuffer(
-          `pt-lmhead-logits:${chunkIndex}`,
-          rowCount * 4,
-          GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
-        );
-        const params = this.gpu.createBufferFromData(
-          `pt-lmhead-params:${chunkIndex}`,
-          new Uint32Array([inputSize, rowCount]),
-          GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-        );
-        try {
-          const pipeline = this.gpu.getOrCreatePipeline(
-            "pt-bf16-matvec",
-            this.shaders.bf16_matvec
-          );
-          const bindGroup = this.gpu.createBindGroup(pipeline, 0, [
-            inputBuffer,
-            weightBuffer,
-            logitsBuffer,
-            params
-          ]);
-          this.gpu.dispatch(pipeline, [bindGroup], Math.ceil(rowCount / 256));
-          const localBest = await this.#argmaxBuffer(logitsBuffer, rowCount);
-          if (localBest.value > bestValue) {
-            bestValue = localBest.value;
-            bestToken = startRow + localBest.index;
-          }
-        } finally {
-          weightBuffer.destroy();
-          logitsBuffer.destroy();
-          params.destroy();
+        const localBest = await this.#argmaxBuffer(logitsBuffer, rowCount);
+        if (localBest.value > bestValue) {
+          bestValue = localBest.value;
+          bestToken = startRow + localBest.index;
         }
+      } finally {
+        logitsBuffer.destroy();
+        params.destroy();
       }
-    } finally {
-      inputBuffer.destroy();
     }
 
     return bestToken;
@@ -1179,8 +1609,11 @@ export class PapertrailQwenCustomEngine {
       modelId,
       revision,
       manifest,
-      fetchRangeBytes
+      fetchRangeBytes,
+      statusCallback
     });
+    this.gpu = gpu;
+    this.shaders = shaders ?? {};
     this.tensorNames = this.tensorStore.listNames();
     this.textPrefix = detectTextPrefix(this.tensorNames);
     this.layerPlans = buildLayerPlans(this.textConfig, this.textPrefix);
@@ -1218,6 +1651,104 @@ export class PapertrailQwenCustomEngine {
       quantConfig,
       statusCallback
     });
+    this.gpuWeightBufferCache = new Map();
+  }
+
+  async prepareForInference({ onProgress = null } = {}) {
+    const vectorNames = new Set([this.finalNormName]);
+    const projectionNames = new Set();
+
+    for (const layerPlan of this.layerPlans) {
+      vectorNames.add(layerPlan.inputNorm);
+      vectorNames.add(layerPlan.postNorm);
+      projectionNames.add(layerPlan.gateProj);
+      projectionNames.add(layerPlan.upProj);
+      projectionNames.add(layerPlan.downProj);
+      if (layerPlan.isLinear) {
+        vectorNames.add(layerPlan.attention.norm);
+        vectorNames.add(layerPlan.attention.dtBias);
+        vectorNames.add(layerPlan.attention.aLog);
+        vectorNames.add(layerPlan.attention.conv1d);
+        projectionNames.add(layerPlan.attention.inProjQkv);
+        projectionNames.add(layerPlan.attention.inProjZ);
+        projectionNames.add(layerPlan.attention.inProjB);
+        projectionNames.add(layerPlan.attention.inProjA);
+        projectionNames.add(layerPlan.attention.outProj);
+      } else {
+        vectorNames.add(layerPlan.attention.qNorm);
+        vectorNames.add(layerPlan.attention.kNorm);
+        projectionNames.add(layerPlan.attention.qProj);
+        projectionNames.add(layerPlan.attention.kProj);
+        projectionNames.add(layerPlan.attention.vProj);
+        projectionNames.add(layerPlan.attention.oProj);
+      }
+    }
+
+    const vectorList = [...vectorNames];
+    for (let index = 0; index < vectorList.length; index += 1) {
+      const name = vectorList[index];
+      onProgress?.({
+        phase: "warmup-vectors",
+        progress: vectorList.length ? (index + 1) / vectorList.length : 1,
+        detail: `Caching vector ${index + 1}/${vectorList.length}: ${name}`
+      });
+      if (name.endsWith("conv1d.weight")) {
+        await this.tensorStore.getStructuredVector(name);
+      } else {
+        await this.#weightVector(name);
+      }
+      await this.#gpuWeightBuffer(name, {
+        shiftNorm:
+          this.shouldShiftNormWeights &&
+          (
+            name.endsWith(".input_layernorm.weight") ||
+            name.endsWith(".post_attention_layernorm.weight") ||
+            name.endsWith(".q_norm.weight") ||
+            name.endsWith(".k_norm.weight") ||
+            name === this.finalNormName
+          )
+      });
+    }
+
+    onProgress?.({
+      phase: "warmup-embeddings",
+      progress: 0,
+      detail: `Caching full embedding tensor: ${this.embedName}`
+    });
+    await this.tensorStore.ensureTensorCached(this.embedName);
+
+    const projectionList = [...projectionNames];
+    for (let index = 0; index < projectionList.length; index += 1) {
+      const name = projectionList[index];
+      onProgress?.({
+        phase: "warmup-projections",
+        progress: projectionList.length ? (index + 1) / projectionList.length : 1,
+        detail: `Caching projection ${index + 1}/${projectionList.length}: ${name}`
+      });
+      await this.projector.prefetchProjection(name, { uploadToGpu: false });
+    }
+
+    if (this.lmHeadName && this.lmHeadName !== this.embedName) {
+      await this.projector.prequantizeLmHead(this.lmHeadName, {
+        onProgress: ({ progress, detail }) => {
+          onProgress?.({
+            phase: "warmup-lm-head",
+            progress,
+            detail
+          });
+        }
+      });
+    } else if (this.lmHeadName) {
+      await this.projector.prequantizeLmHead(this.lmHeadName, {
+        onProgress: ({ progress, detail }) => {
+          onProgress?.({
+            phase: "warmup-lm-head",
+            progress,
+            detail
+          });
+        }
+      });
+    }
   }
 
   makeCaches() {
@@ -1250,28 +1781,161 @@ export class PapertrailQwenCustomEngine {
     });
   }
 
+  async #gpuWeightBuffer(name, { shiftNorm = false } = {}) {
+    const cacheKey = `${name}:${shiftNorm ? "shift" : "plain"}`;
+    if (this.gpuWeightBufferCache.has(cacheKey)) {
+      return this.gpuWeightBufferCache.get(cacheKey);
+    }
+    const values = await this.tensorStore.getVector(name, { shiftNorm });
+    const buffer = this.gpu.createBufferFromData(`pt-weight:${cacheKey}`, values);
+    this.gpuWeightBufferCache.set(cacheKey, buffer);
+    return buffer;
+  }
+
+  async #makeHiddenBuffer(tokenId) {
+    const row = await this.embedToken(tokenId);
+    return this.gpu.createBufferFromData(`pt-hidden:${tokenId}`, row);
+  }
+
+  #destroyBuffer(buffer) {
+    buffer?.destroy?.();
+  }
+
+  async #rmsNormToBuffer(inputBuffer, weightBuffer, length) {
+    const outputBuffer = this.gpu.createBuffer(
+      "pt-rmsnorm-output",
+      length * 4,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+    );
+    const params = this.gpu.createBufferFromData(
+      "pt-rmsnorm-params",
+      createRmsNormParams(length, this.textConfig.rms_norm_eps),
+      GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    );
+    const pipeline = this.gpu.getOrCreatePipeline(
+      "pt-rmsnorm-custom",
+      PAPERTRAIL_RMSNORM_WGSL
+    );
+    const bindGroup = this.gpu.createBindGroup(pipeline, 0, [
+      inputBuffer,
+      weightBuffer,
+      outputBuffer,
+      params
+    ]);
+    this.gpu.dispatch(pipeline, [bindGroup], 1);
+    params.destroy();
+    return outputBuffer;
+  }
+
+  async #addBuffers(leftBuffer, rightBuffer, length) {
+    const outputBuffer = this.gpu.createBuffer(
+      "pt-add-output",
+      length * 4,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+    );
+    const params = this.gpu.createBufferFromData(
+      "pt-add-params",
+      createUintParams([length, 0, 0, 0]),
+      GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    );
+    const pipeline = this.gpu.getOrCreatePipeline(
+      "pt-add-custom",
+      PAPERTRAIL_VECTOR_ADD_WGSL
+    );
+    const bindGroup = this.gpu.createBindGroup(pipeline, 0, [
+      leftBuffer,
+      rightBuffer,
+      outputBuffer,
+      params
+    ]);
+    this.gpu.dispatch(pipeline, [bindGroup], Math.ceil(length / 256));
+    params.destroy();
+    return outputBuffer;
+  }
+
+  async #swigluToBuffer(gateBuffer, upBuffer, length) {
+    const outputBuffer = this.gpu.createBuffer(
+      "pt-swiglu-output",
+      length * 4,
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
+    );
+    const params = this.gpu.createBufferFromData(
+      "pt-swiglu-params",
+      createUintParams([length, 0, 0, 0]),
+      GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    );
+    const pipeline = this.gpu.getOrCreatePipeline(
+      "pt-swiglu-custom",
+      PAPERTRAIL_SWIGLU_WGSL
+    );
+    const bindGroup = this.gpu.createBindGroup(pipeline, 0, [
+      gateBuffer,
+      upBuffer,
+      outputBuffer,
+      params
+    ]);
+    this.gpu.dispatch(pipeline, [bindGroup], Math.ceil(length / 256));
+    params.destroy();
+    return outputBuffer;
+  }
+
   async embedToken(tokenId) {
     return this.tensorStore.getRow(this.embedName, tokenId);
   }
 
-  async #runMlp(input, layerPlan) {
-    const [gate, up] = await Promise.all([
-      this.projector.project(layerPlan.gateProj, input),
-      this.projector.project(layerPlan.upProj, input)
+  async #runMlp(inputBuffer, layerPlan) {
+    const hiddenSize = this.textConfig.hidden_size;
+    const intermediateSize = this.textConfig.intermediate_size;
+    const [gateBuffer, upBuffer] = await Promise.all([
+      this.projector.projectToBuffer(layerPlan.gateProj, inputBuffer, hiddenSize),
+      this.projector.projectToBuffer(layerPlan.upProj, inputBuffer, hiddenSize)
     ]);
-    return this.projector.project(layerPlan.downProj, swiglu(gate, up));
+    const swigluBuffer = await this.#swigluToBuffer(
+      gateBuffer,
+      upBuffer,
+      intermediateSize
+    );
+    this.#destroyBuffer(gateBuffer);
+    this.#destroyBuffer(upBuffer);
+    try {
+      return await this.projector.projectToBuffer(
+        layerPlan.downProj,
+        swigluBuffer,
+        intermediateSize
+      );
+    } finally {
+      this.#destroyBuffer(swigluBuffer);
+    }
   }
 
-  async #runAttention(input, layerPlan, cache) {
+  async #runAttention(inputBuffer, layerPlan, cache) {
     const [qNormWeight, kNormWeight] = await Promise.all([
       this.#weightVector(layerPlan.attention.qNorm),
       this.#weightVector(layerPlan.attention.kNorm)
     ]);
-    const [qRaw, kRaw, vRaw] = await Promise.all([
-      this.projector.project(layerPlan.attention.qProj, input),
-      this.projector.project(layerPlan.attention.kProj, input),
-      this.projector.project(layerPlan.attention.vProj, input)
+    const hiddenSize = this.textConfig.hidden_size;
+    const [qBuffer, kBuffer, vBuffer] = await Promise.all([
+      this.projector.projectToBuffer(layerPlan.attention.qProj, inputBuffer, hiddenSize),
+      this.projector.projectToBuffer(layerPlan.attention.kProj, inputBuffer, hiddenSize),
+      this.projector.projectToBuffer(layerPlan.attention.vProj, inputBuffer, hiddenSize)
     ]);
+    const [qRaw, kRaw, vRaw] = await Promise.all([
+      this.projector.readFloatBuffer(
+        qBuffer,
+        this.textConfig.num_attention_heads * this.headDim * 2
+      ),
+      this.projector.readFloatBuffer(
+        kBuffer,
+        this.textConfig.num_key_value_heads * this.headDim
+      ),
+      this.projector.readFloatBuffer(
+        vBuffer,
+        this.textConfig.num_key_value_heads * this.headDim
+      )
+    ]);
+    this.#destroyBuffer(qBuffer);
+    this.#destroyBuffer(kBuffer);
+    this.#destroyBuffer(vBuffer);
 
     const { queries: fusedQueries, gate } = splitGatedQueryProjection(
       qRaw,
@@ -1332,34 +1996,72 @@ export class PapertrailQwenCustomEngine {
     for (let index = 0; index < flattened.length; index += 1) {
       flattened[index] *= sigmoid(gate[index]);
     }
-    return this.projector.project(layerPlan.attention.oProj, flattened);
+    const flattenedBuffer = this.gpu.createBufferFromData("pt-attn-flat", flattened);
+    try {
+      return await this.projector.projectToBuffer(
+        layerPlan.attention.oProj,
+        flattenedBuffer,
+        flattened.length
+      );
+    } finally {
+      this.#destroyBuffer(flattenedBuffer);
+    }
   }
 
-  async #runLinearAttention(input, layerPlan, cache) {
+  async #runLinearAttention(inputBuffer, layerPlan, cache) {
+    const nk = this.textConfig.linear_num_key_heads;
+    const nv = this.textConfig.linear_num_value_heads;
+    const dk = this.textConfig.linear_key_head_dim;
+    const dv = this.textConfig.linear_value_head_dim;
     const [
       normWeight,
       convWeight,
       dtBias,
       aLog,
-      qkv,
-      zFlat,
-      b,
-      a
+      qkvBuffer,
+      zBuffer,
+      bBuffer,
+      aBuffer
     ] = await Promise.all([
       this.#weightVector(layerPlan.attention.norm),
       this.tensorStore.getStructuredVector(layerPlan.attention.conv1d),
       this.#weightVector(layerPlan.attention.dtBias),
       this.#weightVector(layerPlan.attention.aLog),
-      this.projector.project(layerPlan.attention.inProjQkv, input),
-      this.projector.project(layerPlan.attention.inProjZ, input),
-      this.projector.project(layerPlan.attention.inProjB, input),
-      this.projector.project(layerPlan.attention.inProjA, input)
+      this.projector.projectToBuffer(
+        layerPlan.attention.inProjQkv,
+        inputBuffer,
+        this.textConfig.hidden_size
+      ),
+      this.projector.projectToBuffer(
+        layerPlan.attention.inProjZ,
+        inputBuffer,
+        this.textConfig.hidden_size
+      ),
+      this.projector.projectToBuffer(
+        layerPlan.attention.inProjB,
+        inputBuffer,
+        this.textConfig.hidden_size
+      ),
+      this.projector.projectToBuffer(
+        layerPlan.attention.inProjA,
+        inputBuffer,
+        this.textConfig.hidden_size
+      )
     ]);
+    const [qkv, zFlat, b, a] = await Promise.all([
+      this.projector.readFloatBuffer(
+        qkvBuffer,
+        nk * dk * 2 + nv * dv
+      ),
+      this.projector.readFloatBuffer(zBuffer, nv * dv),
+      this.projector.readFloatBuffer(bBuffer, nv),
+      this.projector.readFloatBuffer(aBuffer, nv)
+    ]);
+    this.#destroyBuffer(qkvBuffer);
+    this.#destroyBuffer(zBuffer);
+    this.#destroyBuffer(bBuffer);
+    this.#destroyBuffer(aBuffer);
 
-    const nk = this.textConfig.linear_num_key_heads;
-    const nv = this.textConfig.linear_num_value_heads;
-    const dk = this.textConfig.linear_key_head_dim;
-    const dv = this.textConfig.linear_value_head_dim;
     const headsPerKey = nv / nk;
 
     const q = new Array(nk);
@@ -1476,43 +2178,103 @@ export class PapertrailQwenCustomEngine {
       outputHeads[valueHead] = normalized;
     }
 
-    return this.projector.project(layerPlan.attention.outProj, flattenHeads(outputHeads));
+    const flattened = flattenHeads(outputHeads);
+    const flattenedBuffer = this.gpu.createBufferFromData("pt-linear-flat", flattened);
+    try {
+      return await this.projector.projectToBuffer(
+        layerPlan.attention.outProj,
+        flattenedBuffer,
+        flattened.length
+      );
+    } finally {
+      this.#destroyBuffer(flattenedBuffer);
+    }
   }
 
-  async #nextTokenFromHidden(hidden) {
-    const finalNorm = await this.#weightVector(this.finalNormName);
-    const normalized = rmsNorm(hidden, finalNorm, this.textConfig.rms_norm_eps);
+  async #nextTokenFromHidden(hiddenBuffer) {
+    const finalNormBuffer = await this.#gpuWeightBuffer(this.finalNormName, {
+      shiftNorm: this.shouldShiftNormWeights
+    });
+    const normalizedBuffer = await this.#rmsNormToBuffer(
+      hiddenBuffer,
+      finalNormBuffer,
+      this.textConfig.hidden_size
+    );
     if (!this.lmHeadName) {
+      this.#destroyBuffer(normalizedBuffer);
       throw new Error("lm_head is unavailable for this checkpoint.");
     }
-    return this.projector.nextTokenFromLmHead(normalized, this.lmHeadName);
+    try {
+      return await this.projector.nextTokenFromLmHeadBuffer(
+        normalizedBuffer,
+        this.textConfig.hidden_size,
+        this.lmHeadName
+      );
+    } finally {
+      this.#destroyBuffer(normalizedBuffer);
+    }
   }
 
   async forwardHidden(tokenId, caches) {
-    let hidden = await this.embedToken(tokenId);
+    let hiddenBuffer = await this.#makeHiddenBuffer(tokenId);
 
     for (const [index, layerPlan] of this.layerPlans.entries()) {
       const [inputNormWeight, postNormWeight] = await Promise.all([
-        this.#weightVector(layerPlan.inputNorm),
-        this.#weightVector(layerPlan.postNorm)
+        this.#gpuWeightBuffer(layerPlan.inputNorm, {
+          shiftNorm:
+            this.shouldShiftNormWeights &&
+            layerPlan.inputNorm.endsWith(".input_layernorm.weight")
+        }),
+        this.#gpuWeightBuffer(layerPlan.postNorm, {
+          shiftNorm:
+            this.shouldShiftNormWeights &&
+            layerPlan.postNorm.endsWith(".post_attention_layernorm.weight")
+        })
       ]);
 
-      const attentionInput = rmsNorm(hidden, inputNormWeight, this.textConfig.rms_norm_eps);
+      const attentionInputBuffer = await this.#rmsNormToBuffer(
+        hiddenBuffer,
+        inputNormWeight,
+        this.textConfig.hidden_size
+      );
       const residual = layerPlan.isLinear
-        ? await this.#runLinearAttention(attentionInput, layerPlan, caches[index])
-        : await this.#runAttention(attentionInput, layerPlan, caches[index]);
-      hidden = addInPlace(hidden, residual);
+        ? await this.#runLinearAttention(attentionInputBuffer, layerPlan, caches[index])
+        : await this.#runAttention(attentionInputBuffer, layerPlan, caches[index]);
+      this.#destroyBuffer(attentionInputBuffer);
+      const hiddenAfterAttention = await this.#addBuffers(
+        hiddenBuffer,
+        residual,
+        this.textConfig.hidden_size
+      );
+      this.#destroyBuffer(hiddenBuffer);
+      this.#destroyBuffer(residual);
 
-      const mlpInput = rmsNorm(hidden, postNormWeight, this.textConfig.rms_norm_eps);
-      hidden = addInPlace(hidden, await this.#runMlp(mlpInput, layerPlan));
+      const mlpInputBuffer = await this.#rmsNormToBuffer(
+        hiddenAfterAttention,
+        postNormWeight,
+        this.textConfig.hidden_size
+      );
+      const mlpResidualBuffer = await this.#runMlp(mlpInputBuffer, layerPlan);
+      this.#destroyBuffer(mlpInputBuffer);
+      hiddenBuffer = await this.#addBuffers(
+        hiddenAfterAttention,
+        mlpResidualBuffer,
+        this.textConfig.hidden_size
+      );
+      this.#destroyBuffer(hiddenAfterAttention);
+      this.#destroyBuffer(mlpResidualBuffer);
     }
 
-    return hidden;
+    return hiddenBuffer;
   }
 
   async forwardToken(tokenId, caches) {
-    const hidden = await this.forwardHidden(tokenId, caches);
-    return this.#nextTokenFromHidden(hidden);
+    const hiddenBuffer = await this.forwardHidden(tokenId, caches);
+    try {
+      return await this.#nextTokenFromHidden(hiddenBuffer);
+    } finally {
+      this.#destroyBuffer(hiddenBuffer);
+    }
   }
 
   async generate(prompt, { maxNewTokens = 160, onPartial = null, shouldInterrupt = null } = {}) {
@@ -1527,6 +2289,14 @@ export class PapertrailQwenCustomEngine {
     this.statusCallback({
       phase: "prompt-tokenized",
       detail: `Prompt tokenized to ${inputIds.length} tokens.`
+    });
+    await this.tensorStore.prefetchRows(this.embedName, inputIds, {
+      onProgress: ({ detail }) => {
+        this.statusCallback({
+          phase: "warming-embeddings",
+          detail
+        });
+      }
     });
 
     const caches = this.makeCaches();

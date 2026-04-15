@@ -297,6 +297,67 @@ const PROFILE_STOPWORDS = new Set([
   "would"
 ]);
 
+const DEFAULT_QWEN_CHAT_SETTINGS = Object.freeze({
+  searchLimit: 12,
+  maxNewTokens: 160,
+  continuationTokens: 96,
+  maxPasses: 3,
+  profileEnabled: true,
+  profileBroadLines: 4,
+  profileFocusedLines: 2,
+  profileFallbackLines: 3,
+  autoNavigate: true,
+  stallTimeoutMs: 90000
+});
+
+function clampSetting(value, min, max, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, Math.round(numeric)));
+}
+
+function normalizeQwenChatSettings(settings = {}) {
+  return {
+    searchLimit: clampSetting(settings.searchLimit, 4, 24, DEFAULT_QWEN_CHAT_SETTINGS.searchLimit),
+    maxNewTokens: clampSetting(settings.maxNewTokens, 64, 320, DEFAULT_QWEN_CHAT_SETTINGS.maxNewTokens),
+    continuationTokens: clampSetting(
+      settings.continuationTokens,
+      32,
+      192,
+      DEFAULT_QWEN_CHAT_SETTINGS.continuationTokens
+    ),
+    maxPasses: clampSetting(settings.maxPasses, 1, 4, DEFAULT_QWEN_CHAT_SETTINGS.maxPasses),
+    profileEnabled: settings.profileEnabled !== false,
+    profileBroadLines: clampSetting(
+      settings.profileBroadLines,
+      1,
+      6,
+      DEFAULT_QWEN_CHAT_SETTINGS.profileBroadLines
+    ),
+    profileFocusedLines: clampSetting(
+      settings.profileFocusedLines,
+      1,
+      4,
+      DEFAULT_QWEN_CHAT_SETTINGS.profileFocusedLines
+    ),
+    profileFallbackLines: clampSetting(
+      settings.profileFallbackLines,
+      1,
+      4,
+      DEFAULT_QWEN_CHAT_SETTINGS.profileFallbackLines
+    ),
+    autoNavigate: settings.autoNavigate !== false,
+    stallTimeoutMs: clampSetting(
+      settings.stallTimeoutMs,
+      30000,
+      180000,
+      DEFAULT_QWEN_CHAT_SETTINGS.stallTimeoutMs
+    )
+  };
+}
+
 function truncateForPrompt(text, maxChars = 220) {
   const clean = cleanSnippet(text ?? "");
   if (clean.length <= maxChars) {
@@ -427,7 +488,7 @@ function scoreDocumentProfileEntry(entry, queryTerms, retrievedPages) {
   return score;
 }
 
-function buildDocumentProfileContext(question, results, documentProfile) {
+function buildDocumentProfileContext(question, results, documentProfile, settings = DEFAULT_QWEN_CHAT_SETTINGS) {
   if (!documentProfile?.memoryPrompt) {
     return {
       prefix: "",
@@ -444,7 +505,11 @@ function buildDocumentProfileContext(question, results, documentProfile) {
     results.map((result) => result.pageNumber).filter((pageNumber) => Number.isFinite(pageNumber))
   );
   const broadQuestion = isSummaryLikeQuestion(question) || results.length === 0;
-  const maxEntries = broadQuestion ? 4 : results.length > 0 ? 2 : 3;
+  const maxEntries = broadQuestion
+    ? settings.profileBroadLines
+    : results.length > 0
+      ? settings.profileFocusedLines
+      : settings.profileFallbackLines;
 
   const rankedEntries = parsed.entries
     .map((entry) => ({
@@ -494,7 +559,13 @@ function buildDocumentProfileContext(question, results, documentProfile) {
   };
 }
 
-function buildGroundedChatRequest(messages, question, results, documentProfile = null) {
+function buildGroundedChatRequest(
+  messages,
+  question,
+  results,
+  documentProfile = null,
+  settings = DEFAULT_QWEN_CHAT_SETTINGS
+) {
   const recentTurns = messages.slice(-3, -1);
   const history = recentTurns.length
     ? recentTurns
@@ -519,7 +590,12 @@ function buildGroundedChatRequest(messages, question, results, documentProfile =
         .join("\n\n")
     : "No strong matches were found in the current PDF.";
 
-  const documentProfileContext = buildDocumentProfileContext(question, results, documentProfile);
+  const documentProfileContext = buildDocumentProfileContext(
+    question,
+    results,
+    documentProfile,
+    settings
+  );
 
   return {
     documentProfileContext,
@@ -789,10 +865,35 @@ export class QwenToolRuntime {
     this._profileUnsub = this.profileEncoder.subscribe(state => {
       this._documentProfile = state.adapter ?? null;
     });
+    this.settings = normalizeQwenChatSettings();
+    this.settingsListeners = new Set();
   }
 
   setToolRegistry(toolRegistry) {
     this.toolRegistry = toolRegistry;
+  }
+
+  getSettings() {
+    return { ...this.settings };
+  }
+
+  updateSettings(partial = {}) {
+    this.settings = normalizeQwenChatSettings({
+      ...this.settings,
+      ...partial
+    });
+    for (const listener of this.settingsListeners) {
+      try {
+        listener(this.getSettings());
+      } catch {}
+    }
+    return this.getSettings();
+  }
+
+  subscribeSettings(listener) {
+    this.settingsListeners.add(listener);
+    listener(this.getSettings());
+    return () => this.settingsListeners.delete(listener);
   }
 
   /**
@@ -923,12 +1024,13 @@ export class QwenToolRuntime {
     const searchQuery = cleanSearchQuery(effectivePrompt);
     if (searchQuery && !explicitPage) {
       // Fetch more candidates so noise + formula filters have room to work
-      results = await this.toolRegistry.search(searchQuery, { limit: 12 });
+      results = await this.toolRegistry.search(searchQuery, { limit: this.settings.searchLimit });
       trace.push(`search(query: "${searchQuery}")`);
     }
 
     // ── Tool: openPage for strongest result when navigating ───────────
     const shouldNavigate =
+      this.settings.autoNavigate &&
       (/\b(open|show|jump|take me|go to|navigate)\b/i.test(prompt) ||
         isPointingFollowUp(prompt)) &&
       results[0];
@@ -955,6 +1057,9 @@ export class QwenToolRuntime {
       trace.push(
         `docProfile(available: ${this._documentProfile.numGroups} sections, chars: ${this._documentProfile.memoryPrompt.length})`
       );
+      if (!this.settings.profileEnabled) {
+        trace.push("docProfile(skipped: disabled)");
+      }
     } else if (this.profileEncoder.state === "encoding") {
       trace.push(`docProfile(status: encoding…)`);
     }
@@ -989,19 +1094,20 @@ export class QwenToolRuntime {
         messages,
         effectivePrompt,
         results,
-        this._documentProfile
+        this.settings.profileEnabled ? this._documentProfile : null,
+        this.settings
       );
       const profileContext = groundedRequest.documentProfileContext;
-      if (this._documentProfile) {
+      if (this._documentProfile && this.settings.profileEnabled) {
         trace.push(
           profileContext.applied
             ? `docProfile(applied: ${profileContext.linesUsed} lines, reason: ${profileContext.reason})`
             : `docProfile(skipped: ${profileContext.reason})`
         );
       }
-      const baseMaxNewTokens = isBroadAnswerQuestion(effectivePrompt) ? 192 : 144;
-      const continuationMaxNewTokens = 96;
-      const maxPasses = 3;
+      const baseMaxNewTokens = this.settings.maxNewTokens;
+      const continuationMaxNewTokens = this.settings.continuationTokens;
+      const maxPasses = this.settings.maxPasses;
       let accumulatedText = "";
       let totalOutputTokens = 0;
       let passesUsed = 0;

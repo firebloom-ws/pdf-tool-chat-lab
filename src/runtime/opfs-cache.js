@@ -57,6 +57,24 @@ export class OpfsCache {
     }
   }
 
+  async readBytesRange(key, start = 0, end = null) {
+    const root = await this.getRoot();
+    if (!root) {
+      return null;
+    }
+    try {
+      const handle = await root.getFileHandle(encodeKey(key));
+      const file = await handle.getFile();
+      const blob = file.slice(start, end ?? file.size);
+      return new Uint8Array(await blob.arrayBuffer());
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "NotFoundError") {
+        return null;
+      }
+      throw error;
+    }
+  }
+
   async writeBlob(key, blob) {
     const bytes = new Uint8Array(await blob.arrayBuffer());
     await this.writeBytes(key, bytes);

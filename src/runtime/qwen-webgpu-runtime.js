@@ -1,3 +1,5 @@
+import { APP_BUILD_ID } from "../build-id.js";
+
 const QWEN_MODEL_ALIASES = {
   "onnx-community/Qwen3.5-0.8B-ONNX": "Intel/Qwen3.5-2B-int4-AutoRound",
   "onnx-community/Qwen3.5-2B-ONNX": "Intel/Qwen3.5-2B-int4-AutoRound",
@@ -16,6 +18,8 @@ export const QWEN_WEBGPU_MODELS = [
 ];
 
 export const DEFAULT_QWEN_WEBGPU_MODEL = QWEN_WEBGPU_MODELS[0].id;
+const LOAD_BOOTSTRAP_TIMEOUT_MS = 120000;
+const LOAD_ACTIVITY_TIMEOUT_MS = 180000;
 
 function normalizeModelId(modelId) {
   return QWEN_MODEL_ALIASES[modelId] ?? modelId ?? DEFAULT_QWEN_WEBGPU_MODEL;
@@ -88,6 +92,10 @@ function summarizeProgress(info, phase = "model") {
 
   if (fileName) {
     return `Loading ${fileName}${groupLabel}…`;
+  }
+
+  if (typeof info.detail === "string" && info.detail.trim()) {
+    return info.detail.trim();
   }
 
   if (typeof info.phase === "string" && info.phase.trim()) {
@@ -186,7 +194,32 @@ export class QwenWebGpuTextRuntime {
   }
 
   async load() {
-    const gpuInfo = await this.webgpuRuntime.probe();
+    this.#updateState({
+      modelId: this.modelId,
+      label: modelLabelFor(this.modelId),
+      status: "loading",
+      ready: false,
+      dtype: null,
+      progress: 1,
+      error: null,
+      detail: `Preparing ${modelLabelFor(this.modelId)}…`
+    });
+
+    let gpuInfo;
+    try {
+      gpuInfo = await this.webgpuRuntime.probe();
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "WebGPU probe failed.";
+      this.#updateState({
+        status: "error",
+        ready: false,
+        error: message,
+        detail: `WebGPU probe failed: ${message}`
+      });
+      throw error;
+    }
+
     if (!gpuInfo.available) {
       this.#updateState({
         status: "unsupported",
@@ -211,7 +244,21 @@ export class QwenWebGpuTextRuntime {
       return this.loadPromise;
     }
 
-    const worker = this.#ensureWorker();
+    let worker;
+    try {
+      worker = this.#ensureWorker();
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to start the model worker.";
+      this.#updateState({
+        status: "error",
+        ready: false,
+        error: message,
+        detail: `Model worker failed to start: ${message}`
+      });
+      throw error;
+    }
+
     const safeGpuInfo = cloneableGpuInfo(gpuInfo);
     this.#updateState({
       modelId: this.modelId,
@@ -219,7 +266,7 @@ export class QwenWebGpuTextRuntime {
       status: "loading",
       ready: false,
       dtype: null,
-      progress: 0,
+      progress: 3,
       error: null,
       detail: `Loading ${modelLabelFor(this.modelId)} with the custom backend…`
     });
@@ -255,7 +302,7 @@ export class QwenWebGpuTextRuntime {
         });
         this.#disposeWorker();
         pendingLoad.reject(error);
-      }, 45000);
+      }, LOAD_BOOTSTRAP_TIMEOUT_MS);
       this.pendingLoad = pendingLoad;
       worker.postMessage({
         type: "load",
@@ -328,14 +375,20 @@ export class QwenWebGpuTextRuntime {
 
     const WorkerCtor = globalThis.Worker;
     if (typeof WorkerCtor !== "function") {
-      throw new Error("worker-unavailable");
+      throw new Error("worker-unavailable: this browser cannot create module workers");
     }
 
-    const workerUrl = new URL("./qwen-webgpu-worker.js", import.meta.url);
-    this.worker = new WorkerCtor(workerUrl.href, {
-      type: "module",
-      name: "papertrail-qwen-worker"
-    });
+    const workerUrl = new URL(`./qwen-webgpu-worker.js?v=${encodeURIComponent(APP_BUILD_ID)}`, import.meta.url);
+    try {
+      this.worker = new WorkerCtor(workerUrl.href, {
+        type: "module",
+        name: "papertrail-qwen-worker"
+      });
+    } catch (error) {
+      throw new Error(
+        `worker-unavailable: ${error instanceof Error ? error.message : "failed to start module worker"}`
+      );
+    }
 
     this.worker.addEventListener("message", (event) => {
       this.#handleWorkerMessage(event.data);
@@ -405,7 +458,7 @@ export class QwenWebGpuTextRuntime {
             });
             this.#disposeWorker();
             pendingLoad.reject(error);
-          }, 45000);
+          }, LOAD_ACTIVITY_TIMEOUT_MS);
         }
         this.#updateState({
           status: "loading",
@@ -504,6 +557,31 @@ export class QwenWebGpuTextRuntime {
       }
 
       case "generate-status": {
+        if (this.state.status === "loading" && this.pendingLoad?.stallTimer) {
+          const pendingLoad = this.pendingLoad;
+          clearTimeout(this.pendingLoad.stallTimer);
+          this.pendingLoad.stallTimer = setTimeout(() => {
+            if (this.pendingLoad !== pendingLoad) {
+              return;
+            }
+            const error = new Error("custom-backend-load-stalled");
+            this.#updateState({
+              status: "error",
+              ready: false,
+              error: error.message,
+              detail:
+                "The custom backend stalled while analyzing the checkpoint or kernels."
+            });
+            this.#disposeWorker();
+            pendingLoad.reject(error);
+          }, LOAD_ACTIVITY_TIMEOUT_MS);
+          this.#updateState({
+            status: "loading",
+            ready: false,
+            detail: message.detail ?? this.state.detail
+          });
+          break;
+        }
         if (this.pendingGeneration) {
           this.pendingGeneration.onStatus?.(message.detail ?? message.phase ?? "working");
         }

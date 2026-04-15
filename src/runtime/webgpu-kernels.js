@@ -23,10 +23,7 @@ fn main(
 ) {
   let row = globalId.y;
   let col = globalId.x;
-
-  if (row >= params.m || col >= params.n) {
-    return;
-  }
+  let inBounds = row < params.m && col < params.n;
 
   let localRow = localId.y;
   let localCol = localId.x;
@@ -41,8 +38,17 @@ fn main(
     let rightIndex = kRight * params.n + col;
     let sharedIndex = localRow * TILE + localCol;
 
-    leftTile[sharedIndex] = select(0.0, leftMatrix[leftIndex], kLeft < params.k);
-    rightTile[sharedIndex] = select(0.0, rightMatrix[rightIndex], kRight < params.k);
+    if (row < params.m && kLeft < params.k) {
+      leftTile[sharedIndex] = leftMatrix[leftIndex];
+    } else {
+      leftTile[sharedIndex] = 0.0;
+    }
+
+    if (col < params.n && kRight < params.k) {
+      rightTile[sharedIndex] = rightMatrix[rightIndex];
+    } else {
+      rightTile[sharedIndex] = 0.0;
+    }
     workgroupBarrier();
 
     for (var inner = 0u; inner < TILE; inner = inner + 1u) {
@@ -51,13 +57,17 @@ fn main(
     workgroupBarrier();
   }
 
-  outputMatrix[row * params.n + col] = total;
+  if (inBounds) {
+    outputMatrix[row * params.n + col] = total;
+  }
 }
 `;
 }
 
 export function buildRmsNormShader() {
   return `
+const WORKGROUP_SIZE: u32 = 64u;
+
 struct Params {
   rows: u32,
   cols: u32,
@@ -69,11 +79,13 @@ struct Params {
 @group(0) @binding(2) var<storage, read_write> outputData: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
+var<workgroup> sharedSums: array<f32, WORKGROUP_SIZE>;
+
 fn epsilon() -> f32 {
   return bitcast<f32>(params.epsilon_bits);
 }
 
-@compute @workgroup_size(64, 1, 1)
+@compute @workgroup_size(WORKGROUP_SIZE, 1, 1)
 fn main(
   @builtin(workgroup_id) workgroupId: vec3<u32>,
   @builtin(local_invocation_id) localId: vec3<u32>
@@ -84,16 +96,15 @@ fn main(
   }
 
   var sumSquares = 0.0;
-  for (var col = localId.x; col < params.cols; col = col + 64u) {
+  for (var col = localId.x; col < params.cols; col = col + WORKGROUP_SIZE) {
     let value = inputData[row * params.cols + col];
     sumSquares = sumSquares + value * value;
   }
 
-  var<workgroup> sharedSums: array<f32, 64>;
   sharedSums[localId.x] = sumSquares;
   workgroupBarrier();
 
-  var stride = 32u;
+  var stride = WORKGROUP_SIZE / 2u;
   loop {
     if (localId.x < stride) {
       sharedSums[localId.x] = sharedSums[localId.x] + sharedSums[localId.x + stride];
@@ -106,7 +117,7 @@ fn main(
   }
 
   let scale = inverseSqrt(sharedSums[0] / f32(params.cols) + epsilon());
-  for (var col = localId.x; col < params.cols; col = col + 64u) {
+  for (var col = localId.x; col < params.cols; col = col + WORKGROUP_SIZE) {
     let index = row * params.cols + col;
     outputData[index] = inputData[index] * scale * weightData[col];
   }

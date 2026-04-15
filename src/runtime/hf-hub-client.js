@@ -5,6 +5,7 @@ const SMALL_CACHE_LIMIT = 8_000_000;
 
 let hubModulePromise = null;
 let jinjaModulePromise = null;
+const resolvedRangeUrls = new Map();
 
 async function loadHubModule() {
   if (!hubModulePromise) {
@@ -57,18 +58,84 @@ export class HfHubClient {
   }
 
   async fetchRange(repo, path, start, end) {
-    const response = await fetch(
-      `https://huggingface.co/${repo}/resolve/main/${encodeHubPath(path)}?download=1`,
-      {
+    const key = `${repo}:main:${path}`;
+    const initialUrl =
+      resolvedRangeUrls.get(key) ??
+      `https://huggingface.co/${repo}/resolve/main/${encodeHubPath(path)}?download=1`;
+    let response = await fetch(initialUrl, {
+      headers: {
+        Range: `bytes=${start}-${Math.max(start, end - 1)}`
+      }
+    });
+    if (!(response.ok || response.status === 206)) {
+      return null;
+    }
+    if (response.url) {
+      resolvedRangeUrls.set(key, response.url);
+    }
+    if (response.status !== 206 && start > 0 && response.url && response.url !== initialUrl) {
+      const retry = await fetch(response.url, {
         headers: {
           Range: `bytes=${start}-${Math.max(start, end - 1)}`
         }
+      });
+      if (retry.ok || retry.status === 206) {
+        response = retry;
       }
-    );
-    if (!response.ok && response.status !== 206) {
-      return null;
     }
-    return response.arrayBuffer();
+    const total = Math.max(0, end - start);
+    if (total === 0) {
+      return new ArrayBuffer(0);
+    }
+
+    if (!response.body) {
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      const sliced =
+        response.status === 206
+          ? bytes.slice(0, Math.min(total, bytes.byteLength))
+          : bytes.slice(start, Math.min(end, bytes.byteLength));
+      return sliced.buffer.slice(sliced.byteOffset, sliced.byteOffset + sliced.byteLength);
+    }
+
+    const reader = response.body.getReader();
+    const bytes = new Uint8Array(total);
+    let loaded = 0;
+    let skip = response.status === 206 ? 0 : start;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (!value?.byteLength) {
+        continue;
+      }
+
+      let chunk = value;
+      if (skip > 0) {
+        if (skip >= chunk.byteLength) {
+          skip -= chunk.byteLength;
+          continue;
+        }
+        chunk = chunk.subarray(skip);
+        skip = 0;
+      }
+
+      const remaining = total - loaded;
+      if (remaining <= 0) {
+        break;
+      }
+      const writeChunk = chunk.byteLength > remaining ? chunk.subarray(0, remaining) : chunk;
+      bytes.set(writeChunk, loaded);
+      loaded += writeChunk.byteLength;
+      if (loaded >= total) {
+        await reader.cancel("range-complete");
+        break;
+      }
+    }
+
+    const sliced = loaded === total ? bytes : bytes.slice(0, loaded);
+    return sliced.buffer.slice(sliced.byteOffset, sliced.byteOffset + sliced.byteLength);
   }
 
   async fetchText(repo, path, options) {

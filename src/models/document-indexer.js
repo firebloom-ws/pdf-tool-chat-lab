@@ -12,6 +12,120 @@ function mergeBbox(a, b) {
   return { x, y, width, height };
 }
 
+function bboxRight(bbox) {
+  return bbox.x + bbox.width;
+}
+
+function bboxBottom(bbox) {
+  return bbox.y + bbox.height;
+}
+
+function bboxCenterX(bbox) {
+  return bbox.x + bbox.width / 2;
+}
+
+function median(values) {
+  if (!values.length) {
+    return 0;
+  }
+  const sorted = [...values].sort((left, right) => left - right);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) / 2
+    : sorted[mid];
+}
+
+function normalizeLine(items) {
+  return {
+    text: items.map((item) => item.text).join(" ").replace(/\s+/g, " ").trim(),
+    bbox: items.reduce((acc, item) => mergeBbox(acc, item.bbox), null)
+  };
+}
+
+function splitRowIntoSegments(items) {
+  const sorted = [...items].sort((left, right) => left.bbox.x - right.bbox.x);
+  if (sorted.length <= 1) {
+    return [sorted];
+  }
+
+  const medianWidth = median(
+    sorted.map((item) => item.bbox.width).filter((width) => Number.isFinite(width) && width > 0)
+  );
+  const gapThreshold = Math.max(0.08, medianWidth * 2.5);
+  const segments = [];
+  let current = [sorted[0]];
+
+  for (let index = 1; index < sorted.length; index += 1) {
+    const item = sorted[index];
+    const previous = current.at(-1);
+    const gap = item.bbox.x - bboxRight(previous.bbox);
+    if (gap > gapThreshold) {
+      segments.push(current);
+      current = [item];
+      continue;
+    }
+    current.push(item);
+  }
+
+  if (current.length) {
+    segments.push(current);
+  }
+  return segments;
+}
+
+function sortLinesTopDown(lines) {
+  return [...lines].sort((left, right) => {
+    const yDelta = left.bbox.y - right.bbox.y;
+    if (Math.abs(yDelta) > 0.012) {
+      return yDelta;
+    }
+    return left.bbox.x - right.bbox.x;
+  });
+}
+
+function detectColumnLayout(lines) {
+  const candidates = lines.filter(
+    (line) => line.text && line.bbox.width <= 0.48 && line.bbox.height <= 0.08
+  );
+  const leftLines = candidates.filter((line) => bboxCenterX(line.bbox) < 0.48);
+  const rightLines = candidates.filter((line) => bboxCenterX(line.bbox) > 0.52);
+  if (leftLines.length < 3 || rightLines.length < 3) {
+    return null;
+  }
+
+  return {
+    columnTop: Math.min(
+      ...leftLines.map((line) => line.bbox.y),
+      ...rightLines.map((line) => line.bbox.y)
+    ),
+    columnBottom: Math.max(
+      ...leftLines.map((line) => bboxBottom(line.bbox)),
+      ...rightLines.map((line) => bboxBottom(line.bbox))
+    )
+  };
+}
+
+function bucketLine(line, layout) {
+  if (!layout) {
+    return "single";
+  }
+
+  const narrow = line.bbox.width <= 0.48;
+  const center = bboxCenterX(line.bbox);
+  const bottom = bboxBottom(line.bbox);
+
+  if (bottom <= layout.columnTop + 0.03) {
+    return "top";
+  }
+  if (line.bbox.y >= layout.columnBottom - 0.03) {
+    return "bottom";
+  }
+  if (narrow) {
+    return center < 0.5 ? "left" : "right";
+  }
+  return "bridge";
+}
+
 function groupItemsIntoLines(textItems) {
   const sorted = [...textItems].sort((left, right) => {
     const yDelta = left.bbox.y - right.bbox.y;
@@ -37,27 +151,16 @@ function groupItemsIntoLines(textItems) {
     line.bbox = mergeBbox(line.bbox, item.bbox);
   }
 
-  return lines.map((line) => ({
-    text: line.items.map((item) => item.text).join(" ").replace(/\s+/g, " ").trim(),
-    bbox: line.bbox
-  }));
+  return sortLinesTopDown(
+    lines.flatMap((line) =>
+      splitRowIntoSegments(line.items)
+        .map((segment) => normalizeLine(segment))
+        .filter((segment) => segment.text)
+    )
+  );
 }
 
-function linesToChunks(lines, pageNumber) {
-  if (!lines.length) {
-    return [
-      {
-        pageNumber,
-        text: "[Image page — no text layer detected]",
-        bbox: { x: 0.08, y: 0.08, width: 0.84, height: 0.84 },
-        blockCount: 1,
-        lineCount: 0,
-        lines: [],
-        isFallback: true
-      }
-    ];
-  }
-
+function buildChunksFromLines(lines, pageNumber) {
   const chunks = [];
   let current = {
     pageNumber,
@@ -113,6 +216,48 @@ function linesToChunks(lines, pageNumber) {
   }
 
   return chunks;
+}
+
+function linesToChunks(lines, pageNumber) {
+  if (!lines.length) {
+    return [
+      {
+        pageNumber,
+        text: "[Image page — no text layer detected]",
+        bbox: { x: 0.08, y: 0.08, width: 0.84, height: 0.84 },
+        blockCount: 1,
+        lineCount: 0,
+        lines: [],
+        isFallback: true
+      }
+    ];
+  }
+
+  const orderedLines = sortLinesTopDown(lines);
+  const layout = detectColumnLayout(orderedLines);
+  if (!layout) {
+    return buildChunksFromLines(orderedLines, pageNumber);
+  }
+
+  const buckets = {
+    top: [],
+    left: [],
+    right: [],
+    bridge: [],
+    bottom: []
+  };
+
+  for (const line of orderedLines) {
+    buckets[bucketLine(line, layout)].push(line);
+  }
+
+  return [
+    ...buildChunksFromLines(sortLinesTopDown(buckets.top), pageNumber),
+    ...buildChunksFromLines(sortLinesTopDown(buckets.left), pageNumber),
+    ...buildChunksFromLines(sortLinesTopDown(buckets.right), pageNumber),
+    ...buildChunksFromLines(sortLinesTopDown(buckets.bridge), pageNumber),
+    ...buildChunksFromLines(sortLinesTopDown(buckets.bottom), pageNumber)
+  ];
 }
 
 function buildSnippet(text) {

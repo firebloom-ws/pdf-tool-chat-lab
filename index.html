@@ -130,45 +130,207 @@
             </div>
           </section>
 
+          <div
+            id="chat-resize-handle"
+            class="chat-resize-handle"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize chat sidebar"
+            tabindex="0"
+          ></div>
+
           <!-- Chat panel -->
           <aside class="chat-panel">
-            <div class="chat-doc-header" id="doc-header"></div>
-            <div class="chat-model-bar">
-              <label class="model-stack" for="model-select">
-                <span>Model</span>
-                <select id="model-select" class="model-select">
-                  <option value="Intel/Qwen3.5-2B-int4-AutoRound">2B AutoRound</option>
-                </select>
-              </label>
-              <button id="load-model-button" class="model-load-btn" type="button">Load Model</button>
-            </div>
-            <p id="model-status-text" class="model-status-text">
-              2B AutoRound is not loaded yet. Search fallback remains available.
-            </p>
-            <div id="model-progress-panel" class="model-progress-panel" hidden>
-              <div class="model-progress-head">
-                <span id="model-progress-phase" class="model-progress-phase">Preparing model…</span>
-                <span id="model-progress-percent" class="model-progress-percent">0%</span>
+            <div class="chat-panel-topline">
+              <div>
+                <p class="chat-panel-kicker">TRAIN MY OWN PDF GPT</p>
+                <p class="chat-panel-caption">Local retrieval, profile memory, and WebGPU chat</p>
               </div>
-              <div class="model-progress-bar" aria-hidden="true">
-                <div id="model-progress-fill" class="model-progress-fill"></div>
+              <div class="chat-panel-actions">
+                <p class="chat-panel-hint">Drag node headers. Drag divider to resize.</p>
+                <button id="reset-chat-layout-button" class="chat-panel-reset" type="button">Reset layout</button>
               </div>
             </div>
-            <div id="chat-log" class="chat-log"></div>
-            <form id="chat-form" class="chat-form">
-              <textarea
-                id="chat-input"
-                class="chat-input"
-                name="message"
-                rows="1"
-                placeholder="Ask anything about this document&hellip;"
-              ></textarea>
-              <button class="send-btn" type="submit" aria-label="Send">
-                <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-                  <path d="M7.5 12V3M3.5 7l4-4 4 4" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-              </button>
-            </form>
+
+            <div class="chat-board-wrap">
+              <div id="chat-board" class="chat-board" aria-label="Chat workflow board">
+                <svg id="chat-board-wires" class="chat-board-wires" aria-hidden="true"></svg>
+
+                <section class="chat-node chat-node--doc" data-chat-node="doc">
+                  <header class="chat-node-header" aria-expanded="true">
+                    <span class="chat-node-title">Document</span>
+                    <span class="chat-node-header-meta">drag / click</span>
+                  </header>
+                  <div class="chat-node-body">
+                    <div class="chat-doc-header" id="doc-header"></div>
+                    <p class="chat-node-footnote">
+                      Indexed sections feed search, citations, and region highlights.
+                    </p>
+                  </div>
+                  <button class="chat-node-resize-handle" type="button" aria-label="Resize Document block"></button>
+                </section>
+
+                <section class="chat-node chat-node--model" data-chat-node="model">
+                  <header class="chat-node-header" aria-expanded="true">
+                    <span class="chat-node-title">Model</span>
+                    <span class="chat-node-header-meta">drag / click</span>
+                  </header>
+                  <div class="chat-node-body">
+                    <div class="chat-model-bar">
+                      <label class="model-stack" for="model-select">
+                        <span>Checkpoint</span>
+                        <select id="model-select" class="model-select">
+                          <option value="Intel/Qwen3.5-2B-int4-AutoRound">2B AutoRound</option>
+                        </select>
+                      </label>
+                      <button id="load-model-button" class="model-load-btn" type="button">Load Model</button>
+                    </div>
+                    <p id="model-status-text" class="model-status-text">
+                      2B AutoRound is not loaded yet. Search fallback remains available.
+                    </p>
+                    <div id="model-progress-panel" class="model-progress-panel" hidden>
+                      <div class="model-progress-head">
+                        <span id="model-progress-phase" class="model-progress-phase">Preparing model…</span>
+                        <span id="model-progress-percent" class="model-progress-percent">0%</span>
+                      </div>
+                      <div class="model-progress-bar" aria-hidden="true">
+                        <div id="model-progress-fill" class="model-progress-fill"></div>
+                      </div>
+                    </div>
+                  </div>
+                  <button class="chat-node-resize-handle" type="button" aria-label="Resize Model block"></button>
+                </section>
+
+                <section class="chat-node chat-node--config" data-chat-node="config">
+                  <header class="chat-node-header" aria-expanded="true">
+                    <span class="chat-node-title">Config</span>
+                    <span class="chat-node-header-meta">drag / click</span>
+                  </header>
+                  <div class="chat-node-body">
+                    <div class="config-group">
+                      <p class="config-group-title">Retrieval</p>
+                    <label class="config-row" for="config-search-limit">
+                      <span class="config-label">Search hits</span>
+                      <div class="config-control">
+                        <input id="config-search-limit" class="config-range" type="range" min="6" max="20" step="1" value="12" />
+                        <output id="config-search-limit-value" class="config-value">12</output>
+                      </div>
+                    </label>
+                    </div>
+
+                    <div class="config-group">
+                      <p class="config-group-title">Generation</p>
+                    <label class="config-row" for="config-max-new-tokens">
+                      <span class="config-label">Answer tokens</span>
+                      <div class="config-control">
+                        <input id="config-max-new-tokens" class="config-range" type="range" min="96" max="256" step="16" value="160" />
+                        <output id="config-max-new-tokens-value" class="config-value">160</output>
+                      </div>
+                    </label>
+
+                    <label class="config-row" for="config-continuation-tokens">
+                      <span class="config-label">Continuation tokens</span>
+                      <div class="config-control">
+                        <input id="config-continuation-tokens" class="config-range" type="range" min="48" max="160" step="16" value="96" />
+                        <output id="config-continuation-tokens-value" class="config-value">96</output>
+                      </div>
+                    </label>
+
+                    <label class="config-row" for="config-max-passes">
+                      <span class="config-label">Continuation passes</span>
+                      <div class="config-control config-control--compact">
+                        <select id="config-max-passes" class="config-select">
+                          <option value="1">1</option>
+                          <option value="2">2</option>
+                          <option value="3" selected>3</option>
+                          <option value="4">4</option>
+                        </select>
+                      </div>
+                    </label>
+                    </div>
+
+                    <div class="config-group">
+                      <p class="config-group-title">Profile Memory</p>
+                    <label class="config-row" for="config-profile-broad-lines">
+                      <span class="config-label">Summary lines</span>
+                      <div class="config-control">
+                        <input id="config-profile-broad-lines" class="config-range" type="range" min="1" max="6" step="1" value="4" />
+                        <output id="config-profile-broad-lines-value" class="config-value">4</output>
+                      </div>
+                    </label>
+
+                    <label class="config-row" for="config-profile-focused-lines">
+                      <span class="config-label">Focused lines</span>
+                      <div class="config-control">
+                        <input id="config-profile-focused-lines" class="config-range" type="range" min="1" max="4" step="1" value="2" />
+                        <output id="config-profile-focused-lines-value" class="config-value">2</output>
+                      </div>
+                    </label>
+
+                    <label class="config-row" for="config-profile-fallback-lines">
+                      <span class="config-label">Fallback lines</span>
+                      <div class="config-control">
+                        <input id="config-profile-fallback-lines" class="config-range" type="range" min="1" max="4" step="1" value="3" />
+                        <output id="config-profile-fallback-lines-value" class="config-value">3</output>
+                      </div>
+                    </label>
+
+                    <label class="config-row" for="config-stall-timeout">
+                      <span class="config-label">Stall timeout</span>
+                      <div class="config-control">
+                        <input id="config-stall-timeout" class="config-range" type="range" min="30" max="180" step="15" value="90" />
+                        <output id="config-stall-timeout-value" class="config-value">90s</output>
+                      </div>
+                    </label>
+
+                    <label class="config-toggle" for="config-profile-enabled">
+                      <input id="config-profile-enabled" type="checkbox" checked />
+                      <span>Use document profile memory</span>
+                    </label>
+
+                    <label class="config-toggle" for="config-auto-navigate">
+                      <input id="config-auto-navigate" type="checkbox" checked />
+                      <span>Auto-open sections for “show me” prompts</span>
+                    </label>
+                    </div>
+                  </div>
+                  <button class="chat-node-resize-handle" type="button" aria-label="Resize Config block"></button>
+                </section>
+
+                <section class="chat-node chat-node--conversation" data-chat-node="conversation">
+                  <header class="chat-node-header" aria-expanded="true">
+                    <span class="chat-node-title">Conversation + Prompt</span>
+                    <span class="chat-node-header-meta">drag / click</span>
+                  </header>
+                  <div class="chat-node-body chat-node-body--conversation">
+                    <div class="chat-log-meta">
+                      <span>Grounded to indexed PDF sections</span>
+                      <span>Click refs to jump and highlight</span>
+                    </div>
+                    <div id="chat-log" class="chat-log"></div>
+                    <div class="chat-form-meta">
+                      <span>Ask for summaries, definitions, or “point it out”.</span>
+                      <span>Enter to send</span>
+                    </div>
+                    <form id="chat-form" class="chat-form">
+                      <textarea
+                        id="chat-input"
+                        class="chat-input"
+                        name="message"
+                        rows="1"
+                        placeholder="Ask anything about this document&hellip;"
+                      ></textarea>
+                      <button class="send-btn" type="submit" aria-label="Send">
+                        <svg width="15" height="15" viewBox="0 0 15 15" fill="none">
+                          <path d="M7.5 12V3M3.5 7l4-4 4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                      </button>
+                    </form>
+                  </div>
+                  <button class="chat-node-resize-handle" type="button" aria-label="Resize Conversation block"></button>
+                </section>
+              </div>
+            </div>
           </aside>
 
         </div>
