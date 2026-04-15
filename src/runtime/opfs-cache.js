@@ -6,6 +6,30 @@ function opfsSupported() {
   );
 }
 
+function isBestEffortWriteError(error) {
+  return (
+    error instanceof DOMException &&
+    (
+      error.name === "UnknownError" ||
+      error.name === "QuotaExceededError" ||
+      error.name === "InvalidStateError" ||
+      error.name === "NoModificationAllowedError" ||
+      error.name === "NotAllowedError" ||
+      error.name === "SecurityError"
+    )
+  );
+}
+
+function isBestEffortStorageError(error) {
+  return isBestEffortWriteError(error) || (
+    error instanceof DOMException &&
+    (
+      error.name === "AbortError" ||
+      error.name === "InvalidAccessError"
+    )
+  );
+}
+
 function encodeKey(value) {
   const bytes = new TextEncoder().encode(value);
   return `blob-${Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
@@ -15,29 +39,60 @@ export class OpfsCache {
   constructor(namespace = "papertrail-lab") {
     this.namespace = namespace;
     this.rootPromise = null;
+    this.writeDisabled = false;
+    this.lastWriteError = null;
+    this.readDisabled = false;
+    this.lastStorageError = null;
+  }
+
+  #disableStorage(error) {
+    this.writeDisabled = true;
+    this.readDisabled = true;
+    this.lastStorageError = error ?? null;
+    this.rootPromise = Promise.resolve(null);
   }
 
   async getRoot() {
     if (!opfsSupported()) {
       return null;
     }
+    if (this.readDisabled) {
+      return null;
+    }
     if (!this.rootPromise) {
       this.rootPromise = navigator.storage
         .getDirectory()
-        .then((root) => root.getDirectoryHandle(this.namespace, { create: true }));
+        .then((root) => root.getDirectoryHandle(this.namespace, { create: true }))
+        .catch((error) => {
+          if (isBestEffortStorageError(error)) {
+            this.#disableStorage(error);
+            return null;
+          }
+          throw error;
+        });
     }
     return this.rootPromise;
   }
 
   async writeBytes(key, bytes) {
     const root = await this.getRoot();
-    if (!root) {
-      return;
+    if (!root || this.writeDisabled) {
+      return false;
     }
-    const handle = await root.getFileHandle(encodeKey(key), { create: true });
-    const writable = await handle.createWritable();
-    await writable.write(bytes);
-    await writable.close();
+    try {
+      const handle = await root.getFileHandle(encodeKey(key), { create: true });
+      const writable = await handle.createWritable();
+      await writable.write(bytes);
+      await writable.close();
+      return true;
+    } catch (error) {
+      if (isBestEffortStorageError(error)) {
+        this.#disableStorage(error);
+        this.lastWriteError = error;
+        return false;
+      }
+      throw error;
+    }
   }
 
   async readBytes(key) {
@@ -51,6 +106,10 @@ export class OpfsCache {
       return new Uint8Array(await file.arrayBuffer());
     } catch (error) {
       if (error instanceof DOMException && error.name === "NotFoundError") {
+        return null;
+      }
+      if (isBestEffortStorageError(error)) {
+        this.#disableStorage(error);
         return null;
       }
       throw error;
@@ -71,13 +130,17 @@ export class OpfsCache {
       if (error instanceof DOMException && error.name === "NotFoundError") {
         return null;
       }
+      if (isBestEffortStorageError(error)) {
+        this.#disableStorage(error);
+        return null;
+      }
       throw error;
     }
   }
 
   async writeBlob(key, blob) {
     const bytes = new Uint8Array(await blob.arrayBuffer());
-    await this.writeBytes(key, bytes);
+    return this.writeBytes(key, bytes);
   }
 
   async readBlob(key, type = "") {
@@ -90,7 +153,7 @@ export class OpfsCache {
 
   async writeJson(key, value) {
     const bytes = new TextEncoder().encode(JSON.stringify(value));
-    await this.writeBytes(key, bytes);
+    return this.writeBytes(key, bytes);
   }
 
   async readJson(key) {
@@ -110,6 +173,10 @@ export class OpfsCache {
       await root.removeEntry(encodeKey(key));
     } catch (error) {
       if (error instanceof DOMException && error.name === "NotFoundError") {
+        return;
+      }
+      if (isBestEffortStorageError(error)) {
+        this.#disableStorage(error);
         return;
       }
       throw error;

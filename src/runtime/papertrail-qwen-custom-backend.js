@@ -251,19 +251,299 @@ export function formatCustomBackendDetail(
   ].join(" ");
 }
 
+function alignTo4(value) {
+  return Math.max(4, Math.ceil(value / 4) * 4);
+}
+
+function toByteView(data) {
+  if (data instanceof Uint8Array) {
+    return data;
+  }
+  if (data instanceof ArrayBuffer) {
+    return new Uint8Array(data);
+  }
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  throw new Error("Unsupported GPU buffer input.");
+}
+
+function serializeError(error) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack ?? null,
+      cause:
+        error.cause instanceof Error
+          ? serializeError(error.cause)
+          : error.cause ?? null
+    };
+  }
+  return {
+    name: typeof error?.name === "string" ? error.name : "Error",
+    message: String(error),
+    stack: null,
+    cause: null
+  };
+}
+
+function summarizeLimits(limits) {
+  if (!limits) {
+    return null;
+  }
+  return {
+    maxBufferSize: Number(limits.maxBufferSize ?? 0),
+    maxStorageBufferBindingSize: Number(limits.maxStorageBufferBindingSize ?? 0),
+    maxComputeWorkgroupStorageSize: Number(limits.maxComputeWorkgroupStorageSize ?? 0),
+    maxComputeInvocationsPerWorkgroup: Number(limits.maxComputeInvocationsPerWorkgroup ?? 0),
+    maxComputeWorkgroupSizeX: Number(limits.maxComputeWorkgroupSizeX ?? 0),
+    maxComputeWorkgroupsPerDimension: Number(limits.maxComputeWorkgroupsPerDimension ?? 0)
+  };
+}
+
+class PapertrailGpuRunner {
+  constructor({ adapter, device, hasF16 = false, diagnostics = null }) {
+    this.adapter = adapter;
+    this.device = device;
+    this.hasF16 = hasF16;
+    this.pipelineCache = new Map();
+    this.diagnostics = diagnostics ?? (() => {});
+  }
+
+  static async create({ diagnostics = null } = {}) {
+    const log = diagnostics ?? (() => {});
+    if (!("gpu" in navigator)) {
+      throw new Error("navigator.gpu is unavailable in this worker.");
+    }
+
+    log("gpu-request-adapter:start");
+    const adapter = await navigator.gpu.requestAdapter({
+      powerPreference: "high-performance"
+    });
+    if (!adapter) {
+      throw new Error("WebGPU adapter request returned null.");
+    }
+
+    const hasF16 = adapter.features?.has?.("shader-f16") ?? false;
+    const requestedFeatures = hasF16 ? ["shader-f16"] : [];
+    log("gpu-request-adapter:ok", {
+      adapterInfo: adapter.info ?? null,
+      limits: summarizeLimits(adapter.limits),
+      requestedFeatures
+    });
+
+    const device = await adapter.requestDevice({
+      requiredFeatures: requestedFeatures
+    });
+
+    device.addEventListener?.("uncapturederror", (event) => {
+      log("gpu-uncapturederror", {
+        error: serializeError(event.error)
+      });
+    });
+    device.lost.then((info) => {
+      log("gpu-device-lost", {
+        reason: info?.reason ?? null,
+        message: info?.message ?? null
+      });
+    });
+
+    log("gpu-request-device:ok", {
+      limits: summarizeLimits(device.limits),
+      hasF16
+    });
+    return new PapertrailGpuRunner({
+      adapter,
+      device,
+      hasF16,
+      diagnostics: log
+    });
+  }
+
+  createBuffer(name, byteLength, usage) {
+    try {
+      return this.device.createBuffer({
+        label: name,
+        size: alignTo4(byteLength),
+        usage
+      });
+    } catch (error) {
+      this.diagnostics("gpu-create-buffer-failed", {
+        label: name,
+        byteLength,
+        usage,
+        error: serializeError(error)
+      });
+      throw error;
+    }
+  }
+
+  createBufferFromData(name, data, usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC) {
+    const bytes = toByteView(data);
+    try {
+      const buffer = this.device.createBuffer({
+        label: name,
+        size: alignTo4(bytes.byteLength),
+        usage,
+        mappedAtCreation: true
+      });
+      new Uint8Array(buffer.getMappedRange()).set(bytes);
+      buffer.unmap();
+      return buffer;
+    } catch (error) {
+      this.diagnostics("gpu-create-buffer-from-data-failed", {
+        label: name,
+        byteLength: bytes.byteLength,
+        usage,
+        error: serializeError(error)
+      });
+      throw error;
+    }
+  }
+
+  async getOrCreateCheckedPipeline(name, shaderCode, entryPoint = "main") {
+    const cacheKey = `${name}:${entryPoint}`;
+    if (this.pipelineCache.has(cacheKey)) {
+      return this.pipelineCache.get(cacheKey);
+    }
+
+    const module = this.device.createShaderModule({
+      label: `${name}:module`,
+      code: shaderCode
+    });
+    const info = await module.getCompilationInfo?.();
+    const messages =
+      info?.messages?.map((message) => ({
+        type: message.type,
+        lineNum: message.lineNum,
+        linePos: message.linePos,
+        message: message.message
+      })) ?? [];
+    if (messages.some((message) => message.type === "error")) {
+      this.diagnostics("gpu-shader-compilation-failed", {
+        name,
+        entryPoint,
+        messages
+      });
+      throw new Error(`Shader compilation failed for ${name}.`);
+    }
+
+    this.device.pushErrorScope?.("validation");
+    this.device.pushErrorScope?.("internal");
+    this.device.pushErrorScope?.("out-of-memory");
+    let pipeline;
+    try {
+      pipeline = await this.device.createComputePipelineAsync({
+        layout: "auto",
+        compute: {
+          module,
+          entryPoint
+        }
+      });
+    } catch (error) {
+      this.diagnostics("gpu-create-pipeline-failed", {
+        name,
+        entryPoint,
+        messages,
+        error: serializeError(error)
+      });
+      throw error;
+    }
+
+    const [oomError, internalError, validationError] = await Promise.all([
+      this.device.popErrorScope?.(),
+      this.device.popErrorScope?.(),
+      this.device.popErrorScope?.()
+    ]);
+    const scopedError = oomError ?? internalError ?? validationError ?? null;
+    if (scopedError) {
+      this.diagnostics("gpu-create-pipeline-scoped-error", {
+        name,
+        entryPoint,
+        error: serializeError(scopedError)
+      });
+      throw scopedError;
+    }
+
+    this.pipelineCache.set(cacheKey, pipeline);
+    return pipeline;
+  }
+
+  getOrCreatePipeline(name, shaderCode, entryPoint = "main") {
+    const cacheKey = `${name}:${entryPoint}`;
+    if (this.pipelineCache.has(cacheKey)) {
+      return this.pipelineCache.get(cacheKey);
+    }
+    const pipeline = this.device.createComputePipeline({
+      layout: "auto",
+      compute: {
+        module: this.device.createShaderModule({
+          label: `${name}:module`,
+          code: shaderCode
+        }),
+        entryPoint
+      }
+    });
+    this.pipelineCache.set(cacheKey, pipeline);
+    return pipeline;
+  }
+
+  createBindGroup(pipeline, index, buffers) {
+    return this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(index),
+      entries: buffers.map((buffer, binding) => ({
+        binding,
+        resource: { buffer }
+      }))
+    });
+  }
+
+  dispatch(pipeline, bindGroups, x = 1, y = 1, z = 1) {
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    bindGroups.forEach((bindGroup, index) => {
+      pass.setBindGroup(index, bindGroup);
+    });
+    pass.dispatchWorkgroups(x, y, z);
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+  }
+
+  async readFloat32Buffer(buffer, count) {
+    const byteLength = count * Float32Array.BYTES_PER_ELEMENT;
+    const staging = this.createBuffer(
+      "pt-readback-f32",
+      byteLength,
+      GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+    );
+    const encoder = this.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(buffer, 0, staging, 0, byteLength);
+    this.device.queue.submit([encoder.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const values = new Float32Array(count);
+    values.set(new Float32Array(staging.getMappedRange(), 0, count));
+    staging.unmap();
+    staging.destroy();
+    return values;
+  }
+}
+
 export class PapertrailQwenKernelHarness {
-  constructor(GpuOps, shaders) {
-    this.GpuOps = GpuOps;
+  constructor({ shaders, diagnostics = null } = {}) {
     this.shaders = shaders ?? {};
     this.gpu = null;
+    this.diagnostics = diagnostics ?? (() => {});
   }
 
   async init() {
     if (this.gpu) {
       return this.gpu;
     }
-    this.gpu = new this.GpuOps();
-    await this.gpu.init();
+    this.gpu = await PapertrailGpuRunner.create({
+      diagnostics: this.diagnostics
+    });
     return this.gpu;
   }
 
@@ -304,7 +584,10 @@ export class PapertrailQwenKernelHarness {
     );
 
     try {
-      const pipeline = gpu.getOrCreatePipeline("pt-qwen-selftest-gptq", shaderCode);
+      const pipeline = await gpu.getOrCreateCheckedPipeline(
+        "pt-qwen-selftest-gptq",
+        shaderCode
+      );
       const bindGroup = gpu.createBindGroup(pipeline, 0, [
         inputBuffer,
         qweightBuffer,
@@ -314,7 +597,7 @@ export class PapertrailQwenKernelHarness {
       ]);
 
       gpu.dispatch(pipeline, [bindGroup], 1);
-      const actual = gpu.readBuffer(outputBuffer, N * 4);
+      const actual = await gpu.readFloat32Buffer(outputBuffer, N);
       const expected = input.reduce((total, value) => total + value, 0);
       const maxError = Math.max(
         ...Array.from(actual, (value) => Math.abs(value - expected))

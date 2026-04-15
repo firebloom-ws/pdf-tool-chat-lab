@@ -26,6 +26,7 @@ export function createQwenBackendController({ post }) {
   let kernelModulesPromise = null;
   const decoder = new TextDecoder();
   const resolvedFileUrls = new Map();
+  const diagnostics = [];
 
   const runtime = {
     modelId: QWEN_BACKEND_MODEL_ID,
@@ -47,6 +48,23 @@ export function createQwenBackendController({ post }) {
 
   function emit(type, data = {}) {
     post({ type, ...data });
+  }
+
+  function recordDiagnostic(event, payload = null) {
+    const entry = {
+      time: new Date().toISOString(),
+      event,
+      payload
+    };
+    diagnostics.push(entry);
+    if (diagnostics.length > 80) {
+      diagnostics.shift();
+    }
+    try {
+      console.info("[papertrail:qwen]", event, payload ?? "");
+    } catch {
+      // Ignore console serialization failures in workers.
+    }
   }
 
   function encodeHubPath(path) {
@@ -139,14 +157,48 @@ export function createQwenBackendController({ post }) {
   async function loadKernelModules() {
     if (!kernelModulesPromise) {
       installKernelBundleDomShims();
+      recordDiagnostic("kernel-modules:import:start");
       kernelModulesPromise = import(
         new URL("./tensorbend/gpu-ops-CgR4iK87.js", import.meta.url).href
-      ).then((gpuOpsModule) => ({
-        GpuOps: gpuOpsModule.G,
-        shaders: gpuOpsModule.S ?? {}
-      }));
+      )
+        .then((gpuOpsModule) => {
+          const shaderKeys = Object.keys(gpuOpsModule.S ?? {});
+          recordDiagnostic("kernel-modules:import:ok", {
+            shaderCount: shaderKeys.length,
+            sampleShaders: shaderKeys.slice(0, 12)
+          });
+          return {
+            shaders: gpuOpsModule.S ?? {}
+          };
+        })
+        .catch((error) => {
+          recordDiagnostic("kernel-modules:import:failed", {
+            error: serializeErrorForTransport(error)
+          });
+          throw error;
+        });
     }
     return kernelModulesPromise;
+  }
+
+  function serializeErrorForTransport(error) {
+    if (error instanceof Error) {
+      return {
+        name: error.name,
+        message: error.message,
+        stack: error.stack ?? null,
+        cause:
+          error.cause instanceof Error
+            ? serializeErrorForTransport(error.cause)
+            : error.cause ?? null
+      };
+    }
+    return {
+      name: typeof error?.name === "string" ? error.name : "Error",
+      message: String(error),
+      stack: null,
+      cause: null
+    };
   }
 
   function chooseContextLength(gpuInfo) {
@@ -459,24 +511,45 @@ export function createQwenBackendController({ post }) {
         info: { status: "bootstrapping_custom_kernel_modules", progress: 0.04 }
       });
 
-      const { GpuOps, shaders } = await loadKernelModules();
+      const { shaders } = await loadKernelModules();
 
       emit("load-progress", {
         phase: "runtime",
         info: { status: "custom_kernels_ready", progress: 0.08 }
       });
 
+      runtime.generateStatusDetail = "Fetching model config…";
+      recordDiagnostic("config:fetch:start");
       emit("load-progress", {
         phase: "config",
         info: { status: "fetching_config", progress: 0.14 }
       });
 
       const config = await fetchJson(resolvedModelId, "config.json", revision);
+      recordDiagnostic("config:fetch:ok", {
+        hasTextConfig: Boolean(config?.text_config),
+        modelType: config?.model_type ?? null
+      });
+
+      runtime.generateStatusDetail = "Loading tokenizer and quantization metadata…";
+      recordDiagnostic("metadata:fetch:start");
+      recordDiagnostic("cache:state", {
+        manifestCacheDisabled: Boolean(MANIFEST_CACHE.readDisabled || MANIFEST_CACHE.writeDisabled),
+        textCacheDisabled: Boolean(BACKEND_TEXT_CACHE.readDisabled || BACKEND_TEXT_CACHE.writeDisabled),
+        manifestCacheError: MANIFEST_CACHE.lastStorageError?.message ?? null,
+        textCacheError: BACKEND_TEXT_CACHE.lastStorageError?.message ?? null
+      });
       const [quantConfig, tokenizerBundle] = await Promise.all([
         loadQuantConfig(resolvedModelId, revision, config),
         loadTokenizer(resolvedModelId, revision)
       ]);
+      recordDiagnostic("metadata:fetch:ok", {
+        hasQuantConfig: Boolean(quantConfig),
+        tokenizerClass: tokenizerBundle?.tokenizerConfig?.tokenizer_class ?? null
+      });
 
+      runtime.generateStatusDetail = "Inspecting checkpoint layout…";
+      recordDiagnostic("manifest:inspect:start");
       emit("load-progress", {
         phase: "config",
         info: { status: "inspecting_checkpoint_layout", progress: 0.22 }
@@ -495,20 +568,35 @@ export function createQwenBackendController({ post }) {
           });
         }
       });
+      recordDiagnostic("manifest:inspect:ok", {
+        shardCount: manifest?.shardCount ?? 0,
+        tensorCount: manifest?.tensors?.length ?? 0
+      });
+
+      runtime.generateStatusDetail = "Initializing WebGPU device…";
       emit("load-progress", {
         phase: "runtime",
         info: { status: "initializing_webgpu", progress: 0.34 }
       });
 
-      const kernelHarness = new PapertrailQwenKernelHarness(GpuOps, shaders);
+      const kernelHarness = new PapertrailQwenKernelHarness({
+        shaders,
+        diagnostics: recordDiagnostic
+      });
+      recordDiagnostic("gpu-bootstrap:init:start");
       await kernelHarness.init();
+      recordDiagnostic("gpu-bootstrap:init:ok", {
+        hasF16: Boolean(kernelHarness.gpu?.hasF16)
+      });
 
+      runtime.generateStatusDetail = "Running GPU kernel self-test…";
       emit("load-progress", {
         phase: "runtime",
         info: { status: "running_kernel_self_test", progress: 0.52 }
       });
 
       const selfTest = await kernelHarness.runGptqSelfTest();
+      recordDiagnostic("gpu-bootstrap:self-test:done", selfTest);
       emit("load-progress", {
         phase: "runtime",
         info: {
@@ -524,6 +612,7 @@ export function createQwenBackendController({ post }) {
       });
       analysis.selfTest = selfTest;
 
+      runtime.generateStatusDetail = "Building decoder plan…";
       emit("load-progress", {
         phase: "runtime",
         info: { status: "building_custom_decoder_plan", progress: 0.88 }
@@ -584,7 +673,9 @@ export function createQwenBackendController({ post }) {
         info: { status: "warming_decoder_caches", progress: 0.92 }
       });
 
+      runtime.generateStatusDetail = "Preparing essential decoder weights…";
       await runtime.engine.prepareForInference({
+        warmupMode: "essential",
         onProgress: ({ phase, detail, progress = 0 }) => {
           emit("load-progress", {
             phase: "warmup",
@@ -706,9 +797,22 @@ export function createQwenBackendController({ post }) {
       }
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error);
+      recordDiagnostic("worker-message:failed", {
+        type,
+        error: serializeErrorForTransport(error),
+        lastPhase: runtime.generateStatusDetail ?? null
+      });
       runtime.loading = false;
       if (type === "load") {
-        emit("load-error", { message: text });
+        emit("load-error", {
+          message: text,
+          phaseDetail: runtime.generateStatusDetail ?? null,
+          diagnostics: diagnostics.slice(-20),
+          error:
+            error instanceof Error
+              ? serializeErrorForTransport(error)
+              : { name: "Error", message: text, stack: null, cause: null }
+        });
         return;
       }
       if (type === "generate") {

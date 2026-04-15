@@ -104,7 +104,11 @@ async function main() {
     console.error("Papertrail boot error", event.error ?? event.message);
   });
   window.addEventListener("unhandledrejection", (event) => {
-    console.error("Papertrail unhandled rejection", event.reason);
+    console.error(
+      "Papertrail unhandled rejection",
+      event.reason ?? new Error("Unhandled rejection with no reason")
+    );
+    event.preventDefault();
   });
 }
 

@@ -524,12 +524,25 @@ export class QwenWebGpuTextRuntime {
       }
 
       case "load-error": {
-        const detail = message.message || "Model load failed.";
+        const rawMessage = message.message || "Model load failed.";
+        const phaseDetail =
+          typeof message.phaseDetail === "string" && message.phaseDetail.trim()
+            ? message.phaseDetail.trim()
+            : null;
+        const detail =
+          phaseDetail && phaseDetail !== rawMessage
+            ? `${phaseDetail} (${rawMessage})`
+            : rawMessage;
         this.#updateState({
           status: "error",
           ready: false,
           error: detail,
           detail
+        });
+        console.error("Qwen WebGPU load failed", {
+          detail,
+          workerError: message.error ?? null,
+          diagnostics: Array.isArray(message.diagnostics) ? message.diagnostics : []
         });
         if (this.pendingLoad) {
           this.pendingLoad.reject(new Error(detail));

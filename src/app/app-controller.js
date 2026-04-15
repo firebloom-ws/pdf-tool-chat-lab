@@ -65,6 +65,60 @@ function serializeMessages(messages = []) {
   }));
 }
 
+function clonePdfBytes(bytes) {
+  if (!(bytes instanceof Uint8Array)) {
+    return null;
+  }
+  try {
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  } catch {
+    return null;
+  }
+}
+
+async function resolvePersistablePdfBytes(bundle) {
+  const cloned = clonePdfBytes(bundle?.bytes);
+  if (cloned) {
+    return cloned;
+  }
+  if (!bundle?.file) {
+    return null;
+  }
+  const fileBytes = await bundle.file.arrayBuffer();
+  return fileBytes.slice(0);
+}
+
+function serializeBundleMetadata(metadata) {
+  if (!metadata || typeof metadata !== "object") {
+    return null;
+  }
+
+  const info =
+    metadata.info && typeof metadata.info === "object"
+      ? { ...metadata.info }
+      : null;
+
+  let rawMetadata = null;
+  try {
+    if (metadata.metadata?.getAll) {
+      rawMetadata = metadata.metadata.getAll();
+    } else if (metadata.metadata && typeof metadata.metadata === "object") {
+      rawMetadata = { ...metadata.metadata };
+    }
+  } catch {
+    rawMetadata = null;
+  }
+
+  return {
+    info,
+    contentDispositionFilename:
+      typeof metadata.contentDispositionFilename === "string"
+        ? metadata.contentDispositionFilename
+        : null,
+    metadata: rawMetadata
+  };
+}
+
 function hydrateMessages(messages = []) {
   return messages
     .filter((message) => message?.role && typeof message?.content === "string")
@@ -142,6 +196,16 @@ function createMessageElement(role, text, trace = [], references = []) {
   }
 
   return article;
+}
+
+function toError(error, fallbackMessage) {
+  if (error instanceof Error) {
+    return error;
+  }
+  if (typeof error === "string" && error) {
+    return new Error(error);
+  }
+  return new Error(fallbackMessage);
 }
 
 function createTypingIndicator() {
@@ -904,7 +968,12 @@ export class AppController {
     // File upload via input
     this.elements.upload.addEventListener("change", async (e) => {
       const [file] = e.target.files ?? [];
-      if (file) await this.loadFile(file);
+      if (!file) return;
+      try {
+        await this.loadFile(file);
+      } catch (error) {
+        this.handleDocumentOpenFailure(error, "Failed to open PDF");
+      }
     });
 
     // Drag & drop on the landing zone
@@ -919,7 +988,12 @@ export class AppController {
         e.preventDefault();
         dz.classList.remove("is-dragover");
         const file = e.dataTransfer?.files?.[0];
-        if (file?.type === "application/pdf") await this.loadFile(file);
+        if (file?.type !== "application/pdf") return;
+        try {
+          await this.loadFile(file);
+        } catch (error) {
+          this.handleDocumentOpenFailure(error, "Failed to open PDF");
+        }
       });
     }
 
@@ -1252,7 +1326,9 @@ export class AppController {
     this.messages = [];
     this.renderChatHistory();
     if (this.bundle && this.index) {
-      void this.persistCurrentSnapshot().catch(console.error);
+      void this.persistCurrentSnapshot().catch((error) => {
+        this.handleNonBlockingPersistenceFailure(error, "Failed to save chat history locally");
+      });
     }
   }
 
@@ -1392,14 +1468,22 @@ export class AppController {
     this.qwenRuntime.setToolRegistry(this.toolRegistry);
     this.qwenRuntime.resetDocumentProfile();
 
-    await this.viewer.attachDocument(this.bundle, this.index.pages);
-    await this.persistCurrentSnapshot();
-    await this.refreshSnapshotList();
+    try {
+      await this.viewer.attachDocument(this.bundle, this.index.pages);
+    } catch (error) {
+      console.error("Failed to render loaded PDF", error);
+      this.setStatus("Open failed", "warning");
+      this.setAppState("landing");
+      return;
+    }
 
     this.resetChat();
     this.setAppState("loaded");
     this.updateDocHeader();
     this.setStatus("Ready", "success");
+    void this.refreshSnapshotList().catch((error) => {
+      console.error("Failed to refresh snapshot list", error);
+    });
 
     // Kick off background work — fire & forget
     this.runBackgroundWork().catch(console.error);
@@ -1521,17 +1605,40 @@ export class AppController {
   async persistCurrentSnapshot() {
     if (!this.bundle || !this.index) return;
     this.currentSnapshotId ??= crypto.randomUUID();
+    const pdfBytes = await resolvePersistablePdfBytes(this.bundle);
+    if (!pdfBytes) {
+      throw new Error("pdf-bytes-unavailable-for-persistence");
+    }
     await this.sessionStore.saveSnapshot({
       id: this.currentSnapshotId,
       savedAt: Date.now(),
       title: resolveDocumentTitle(this.bundle),
-      pdfBlob: this.bundle.file,
-      metadata: this.bundle.metadata,
+      pdfBytes,
+      metadata: serializeBundleMetadata(this.bundle.metadata),
       pageCount: this.bundle.pageCount,
       pages: this.index.pages,
       chunks: serializeChunks(this.index.chunks),
       messages: serializeMessages(this.messages)
     });
+  }
+
+  handleNonBlockingPersistenceFailure(error, label) {
+    const normalized = toError(error, label);
+    console.error(label, normalized);
+    this.setBackgroundProgress(label);
+    clearTimeout(this._storageErrorTimer);
+    this._storageErrorTimer = setTimeout(() => {
+      if (this.backgroundProgressMessage === label) {
+        this.setBackgroundProgress("");
+      }
+    }, 4000);
+  }
+
+  handleDocumentOpenFailure(error, label) {
+    const normalized = toError(error, label);
+    console.error(label, normalized);
+    this.setStatus("Open failed", "warning");
+    this.setAppState("landing");
   }
 
   async refreshSnapshotList() {
@@ -1595,10 +1702,14 @@ export class AppController {
     this.setAppState("processing");
     this.setProcessingStatus("Opening document\u2026", snapshot.title ?? "");
 
+    const restoredSource = snapshot.pdfBytes ?? snapshot.pdfBlob;
+    if (!restoredSource) {
+      throw new Error("snapshot-missing-pdf-data");
+    }
     const restoredFile =
-      snapshot.pdfBlob instanceof File
-        ? snapshot.pdfBlob
-        : new File([snapshot.pdfBlob], snapshot.title ?? "document.pdf", {
+      restoredSource instanceof File
+        ? restoredSource
+        : new File([restoredSource], snapshot.title ?? "document.pdf", {
             type: "application/pdf"
           });
 

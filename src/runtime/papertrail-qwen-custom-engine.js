@@ -1654,7 +1654,7 @@ export class PapertrailQwenCustomEngine {
     this.gpuWeightBufferCache = new Map();
   }
 
-  async prepareForInference({ onProgress = null } = {}) {
+  async prepareForInference({ onProgress = null, warmupMode = "essential" } = {}) {
     const vectorNames = new Set([this.finalNormName]);
     const projectionNames = new Set();
 
@@ -1708,6 +1708,15 @@ export class PapertrailQwenCustomEngine {
             name === this.finalNormName
           )
       });
+    }
+
+    if (warmupMode !== "full") {
+      onProgress?.({
+        phase: "warmup-essential-ready",
+        progress: 1,
+        detail: "Essential decoder weights are ready. Large tensors will stream on first use."
+      });
+      return;
     }
 
     onProgress?.({

@@ -51,9 +51,10 @@ function textItemToLayoutItem(item, viewport, pdfJs) {
 
 export async function loadPdfBundle(file) {
   const pdfJs = await loadPdfJs();
-  const bytes = new Uint8Array(await file.arrayBuffer());
+  const sourceBytes = new Uint8Array(await file.arrayBuffer());
+  const bytes = sourceBytes.slice();
   const loadingTask = pdfJs.getDocument({
-    data: bytes,
+    data: sourceBytes,
     useSystemFonts: true,
     isEvalSupported: false,
     enableXfa: true
